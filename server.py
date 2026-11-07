@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from core.accounts import build_pool
 from core.auth import AuthManager
-from core.client import DeepSeekWebClient, HTTPStatusError
+from core.client import DeepSeekWebClient, HTTPStatusError, StreamStalled
 from core.dashboard import DASHBOARD_HTML
 from core.openai_adapter import (
     AVAILABLE_MODELS,
@@ -540,7 +540,8 @@ def create_chat_completion(
         raise HTTPException(status_code=400, detail="Empty prompt / messages.")
 
     session = client._new_session()
-    if reset_reason or not agent.chat_session_id:
+    fresh_chat = bool(reset_reason or not agent.chat_session_id)
+    if fresh_chat:
         if reset_reason:
             print(f"[session:{agent_id}] reset: {reset_reason}")
             agent.reset_remote()
@@ -599,6 +600,7 @@ def create_chat_completion(
             thinking_parts: List[str] = []
             message_id: Optional[str] = None
             finished = False
+            last_emit = time.time()
             try:
                 for event in client.stream_chat(
                     prompt=prompt,
@@ -623,16 +625,25 @@ def create_chat_completion(
                             "",
                         )
                         agent.reset_remote()
+                        if status == 504:
+                            message = (
+                                "DeepSeek upstream stalled (no data received); "
+                                "session reset, retry the request"
+                            )
+                            err_type = "timeout_error"
+                        else:
+                            message = f"DeepSeek upstream HTTP {status}"
+                            err_type = (
+                                "rate_limit_error"
+                                if status == 429
+                                else "authentication_error"
+                                if status in (401, 403)
+                                else "upstream_error"
+                            )
                         err = {
                             "error": {
-                                "message": f"DeepSeek upstream HTTP {status}",
-                                "type": (
-                                    "rate_limit_error"
-                                    if status == 429
-                                    else "authentication_error"
-                                    if status in (401, 403)
-                                    else "upstream_error"
-                                ),
+                                "message": message,
+                                "type": err_type,
                                 "retry_after": max(1, int(cooldown)),
                             }
                         }
@@ -641,6 +652,7 @@ def create_chat_completion(
                         return
                     if kind == "error":
                         # Headers are already sent: report inside the stream.
+                        agent.reset_remote()
                         err = {
                             "error": {
                                 "message": event.get("message", "DeepSeek stream error"),
@@ -666,6 +678,10 @@ def create_chat_completion(
                                 delta = {"role": "assistant", **delta}
                                 emitted_role = True
                             yield make_chunk_sse(completion_id, req.model, delta)
+                    last_emit = time.time()
+                    if time.time() - last_emit > 15:
+                        yield ": keepalive\n\n"
+                        last_emit = time.time()
 
                 full_text = "".join(text_parts)
                 if not emitted_role and not full_text.strip():
@@ -721,6 +737,7 @@ def create_chat_completion(
                             prompt_chars=len(prompt),
                             output_chars=len(full_text) + len("".join(thinking_parts)),
                             message_id=message_id,
+                            fresh_chat=fresh_chat,
                         )
 
         return StreamingResponse(
@@ -747,6 +764,14 @@ def create_chat_completion(
             # now contain a stray turn, so start clean next time.
             agent.reset_remote()
         raise
+    except StreamStalled as exc:
+        cooldown = accounts.mark_failure(account, 504, None, str(exc))
+        agent.reset_remote()
+        raise HTTPException(
+            status_code=504,
+            detail=f"DeepSeek upstream stalled: {exc}",
+            headers={"Retry-After": str(max(1, int(cooldown)))},
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         print("CHAT ERROR:", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -758,6 +783,7 @@ def create_chat_completion(
         prompt_chars=len(prompt),
         output_chars=len(raw_text or ""),
         message_id=message_id,
+        fresh_chat=fresh_chat,
     )
 
     completion_tokens = _estimate_tokens(raw_text)

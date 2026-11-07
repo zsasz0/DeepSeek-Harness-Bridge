@@ -291,49 +291,68 @@ async function send(){
   document.getElementById("sendBtn").disabled = true;
 
   try {
+    const controller = new AbortController();
     const r = await apiFetch("/v1/chat/completions", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({model, messages:[{role:"user",content:text}], stream:true})
+      body: JSON.stringify({model, messages:[{role:"user",content:text}], stream:true}),
+      signal: controller.signal
     });
     if (!r.ok) { a.textContent = "Error: " + await r.text(); return; }
 
     a.textContent = "";
+    a.style.color = "";
+    let idleTimer = setTimeout(() => controller.abort("idle"), 45000);
+    const bumpIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => controller.abort("idle"), 45000);
+    };
     const reader = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream:true});
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t.startsWith("data:")) continue;
-        const data = t.slice(5).trim();
-        if (data === "[DONE]") continue;
-        try {
-          const j = JSON.parse(data);
-          if (j.error) {
-            a.textContent = "Error: " + (j.error.message || JSON.stringify(j.error));
-            a.style.color = "#ff7b72";
-            a.style.whiteSpace = "pre-wrap";
-            continue;
-          }
-          const d = j.choices?.[0]?.delta || {};
-          if (d.content) a.textContent += d.content;
-          if (d.reasoning_content) a.textContent += d.reasoning_content;
-        } catch(e){}
+    try {
+      while (true) {
+        const {done, value} = await reader.read();
+        if (done) break;
+        bumpIdle();
+        buf += dec.decode(value, {stream:true});
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("data:")) continue;
+          const data = t.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try {
+            const j = JSON.parse(data);
+            if (j.error) {
+              a.textContent = "Error: " + (j.error.message || JSON.stringify(j.error));
+              a.style.color = "#ff7b72";
+              a.style.whiteSpace = "pre-wrap";
+              continue;
+            }
+            const d = j.choices?.[0]?.delta || {};
+            if (d.content) a.textContent += d.content;
+            if (d.reasoning_content) a.textContent += d.reasoning_content;
+          } catch(e){}
+        }
+        chat.scrollTop = chat.scrollHeight;
       }
-      chat.scrollTop = chat.scrollHeight;
+    } finally {
+      clearTimeout(idleTimer);
     }
     if (!a.textContent.trim()) {
       a.textContent = "No response (empty stream)";
       a.style.color = "#ffb86b";
     }
   } catch(e) {
-    a.textContent = "Connection error: " + e.message;
+    if (e && (e.name === "AbortError" || String(e).includes("idle"))) {
+      a.textContent = (a.textContent || "") + "\n[stalled - no data for 45s]";
+      a.style.color = "#ffb86b";
+      a.style.whiteSpace = "pre-wrap";
+    } else {
+      a.textContent = "Connection error: " + e.message;
+    }
   } finally {
     document.getElementById("sendBtn").disabled = false;
   }

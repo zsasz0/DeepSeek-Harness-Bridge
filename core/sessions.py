@@ -6,6 +6,14 @@ assistant reply is skipped from the prompt since the remote chat generated it).
 
 Count-based tracking avoids the tool-call shape mismatch: the client echoes an
 assistant tool call in OpenAI shape, while the remote chat saw envelope text.
+
+Context accounting note
+----------------------
+``remote_chars`` measures what the *remote chat* currently holds. On a fresh
+chat that is the size of the prompt we sent. On a continued chat it grows by
+the delta we sent plus the reply. It must never be charged for the full client
+transcript on every turn: agent clients resend the whole history each request,
+so charging that value would reset the session on every single turn.
 """
 
 from __future__ import annotations
@@ -19,10 +27,15 @@ from typing import Any, Dict, List, Optional, Tuple
 SESSION_TTL_MS = int(os.environ.get("DEEPSEEK_SESSION_TTL_MS", str(2 * 60 * 60 * 1000)))
 MAX_MESSAGE_DEPTH = int(os.environ.get("DEEPSEEK_MAX_MESSAGE_DEPTH", "100"))
 MAX_PROMPT_CHARS = int(os.environ.get("DEEPSEEK_MAX_PROMPT_CHARS", "80000"))
+# The remote chat accumulates every turn, so the ceiling must be well above a
+# single prompt. 12x leaves room for ~12 full-size turns before a reset.
 MAX_SESSION_CHARS = int(
-    os.environ.get("DEEPSEEK_MAX_SESSION_CHARS", str(MAX_PROMPT_CHARS * 3))
+    os.environ.get("DEEPSEEK_MAX_SESSION_CHARS", str(MAX_PROMPT_CHARS * 12))
 )
 RECOVERY_HISTORY_TURNS = int(os.environ.get("DEEPSEEK_RECOVERY_HISTORY_TURNS", "8"))
+# After a context reset, ignore the char ceiling for this many turns so the
+# resent history plus reply cannot immediately trigger another reset.
+RESET_COOLDOWN_TURNS = int(os.environ.get("DEEPSEEK_RESET_COOLDOWN_TURNS", "2"))
 
 
 def _tools_key(tools: Optional[List[Dict[str, Any]]]) -> str:
@@ -54,6 +67,7 @@ class AgentSession:
         self.sent_signatures: List[Tuple[str, str, str]] = []
         self.message_count = 0
         self.remote_chars = 0
+        self.turns_since_reset = 0
         self.created_at = time.time()
         self.last_used = self.created_at
         self.history: List[Dict[str, Any]] = []
@@ -79,6 +93,7 @@ class AgentSession:
         self.sent_signatures = []
         self.message_count = 0
         self.remote_chars = 0
+        self.turns_since_reset = 0
         self.created_at = time.time()
 
     def needs_reset(self, now: Optional[float] = None) -> Optional[str]:
@@ -89,7 +104,12 @@ class AgentSession:
             return "max_message_depth"
         if now - self.created_at > SESSION_TTL_MS:
             return "session_ttl"
-        if self.remote_chars >= MAX_SESSION_CHARS:
+        # Skip the char ceiling for the first turns after a reset: those turns
+        # resend the whole transcript and would otherwise reset instantly.
+        if (
+            self.turns_since_reset >= RESET_COOLDOWN_TURNS
+            and self.remote_chars >= MAX_SESSION_CHARS
+        ):
             return "max_context_chars"
         return None
 
@@ -117,16 +137,27 @@ class AgentSession:
         if not self.sent_signatures:
             return messages, "history_mismatch"
 
-        if len(messages) < self.sent_count:
+        # Walk the incoming history and compare only the messages we actually
+        # sent upstream. Assistant replies produced by the remote chat are
+        # echoed back by the client and must be skipped in both lists.
+        cursor = 0
+        matched = 0
+        while cursor < len(messages) and matched < len(self.sent_signatures):
+            message = messages[cursor]
+            if str(message.get("role", "")) == "assistant":
+                cursor += 1
+                continue
+            if _turn_signature(message) != self.sent_signatures[matched]:
+                return messages, "history_mismatch"
+            cursor += 1
+            matched += 1
+
+        if matched != len(self.sent_signatures):
             return messages, "history_mismatch"
 
-        incoming = [_turn_signature(m) for m in messages[: self.sent_count]]
-        if incoming != self.sent_signatures:
-            return messages, "history_mismatch"
-
-        delta = messages[self.sent_count :]
-        # The client echoes our own assistant reply back; the remote chat
-        # already contains it, so never send it again.
+        # Everything before ``cursor`` is already upstream; the tail is new.
+        delta = messages[cursor:]
+        # Never resend the assistant echo that immediately precedes the tail.
         while delta and str(delta[0].get("role", "")) == "assistant":
             delta = delta[1:]
         if not delta:
@@ -140,14 +171,23 @@ class AgentSession:
         prompt_chars: int,
         output_chars: int,
         message_id: Optional[str],
+        fresh_chat: bool = False,
     ) -> None:
-        """Record client messages the remote chat now contains."""
+        """Record client messages the remote chat now contains.
+
+        ``fresh_chat`` means this turn created a new upstream chat, so
+        ``prompt_chars`` is the whole remote context rather than an increment.
+        """
         for message in sent_messages:
             self.sent_signatures.append(_turn_signature(message))
         self.sent_count = len(self.sent_signatures)
         self.tools_key = _tools_key(tools)
         self.message_count += 1
-        self.remote_chars += prompt_chars + output_chars
+        self.turns_since_reset = 0 if fresh_chat else self.turns_since_reset + 1
+        if fresh_chat:
+            self.remote_chars = prompt_chars + output_chars
+        else:
+            self.remote_chars += prompt_chars + output_chars
         if message_id:
             self.parent_message_id = message_id
         self.history = (self.history + list(sent_messages))[-RECOVERY_HISTORY_TURNS * 2 :]

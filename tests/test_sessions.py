@@ -77,9 +77,41 @@ class PlanTests(unittest.TestCase):
         s = AgentSession("a")
         s.chat_session_id = "chat-1"
         s.mark_sent([user("hi")], None, 10, 5, "msg-1")
+        # The char ceiling is skipped for the first turns after a reset.
+        s.turns_since_reset = 5
         with patch.object(sessions_module, "MAX_SESSION_CHARS", 1):
             _, reason = s.plan([user("hi"), assistant("ok"), user("again")], None)
         self.assertEqual(reason, "max_context_chars")
+
+    def test_no_reset_loop_when_prompt_resent(self):
+        """Full history resent every turn must not trigger a reset each turn."""
+        s = AgentSession("a")
+        s.chat_session_id = "chat-1"
+        big = "x" * 20000
+        messages = [user(big)]
+        s.mark_sent(messages, None, 20000, 100, "msg-1", fresh_chat=True)
+        for turn in range(1, 6):
+            messages = messages + [assistant("ok"), user(big)]
+            planned, reason = s.plan(messages, None)
+            self.assertIsNone(reason, f"turn {turn} reset: {reason}")
+            s.mark_sent(planned, None, 20000, 100, f"msg-{turn + 1}")
+
+    def test_fresh_chat_resets_char_counter(self):
+        s = AgentSession("a")
+        s.chat_session_id = "chat-1"
+        s.remote_chars = 999999
+        s.mark_sent([user("hi")], None, 10, 5, "m", fresh_chat=True)
+        self.assertEqual(s.remote_chars, 15)
+
+    def test_reset_cooldown_skips_char_ceiling(self):
+        s = AgentSession("a")
+        s.chat_session_id = "chat-1"
+        s.remote_chars = 10**9
+        s.turns_since_reset = 0
+        with patch.object(sessions_module, "MAX_SESSION_CHARS", 1):
+            self.assertIsNone(s.needs_reset())
+            s.turns_since_reset = sessions_module.RESET_COOLDOWN_TURNS
+            self.assertEqual(s.needs_reset(), "max_context_chars")
 
     def test_reset_remote_keeps_history(self):
         s = AgentSession("a")
