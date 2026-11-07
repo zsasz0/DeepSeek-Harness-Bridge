@@ -378,29 +378,53 @@ values, or just use the dashboard.
 
 #### In-project `accounts/` folder (default)
 
-The easiest setup: create an `accounts/` folder next to `main.py` and drop one
-credential file per account into it. `main.py` points the pool at this folder
-automatically when it exists, so no environment variable is needed:
+The repo ships with an `accounts/` folder next to `main.py`. **This is where you
+put your token.** `main.py` points the pool at this folder automatically when it
+exists, so no environment variable is needed:
 
 ```text
 deepseek-webApi2-v1-json/
 ├── accounts/
-│   ├── acct1.txt
-│   ├── acct2.txt
+│   ├── acct1.txt      ← put your token in this file
+│   ├── acct2.txt      ← optional second account
 │   └── ...
 ├── core/
 ├── main.py
 └── ...
 ```
 
-- Each file holds **one** credential, in any format `parse_credentials`
-  understands: a bare `userToken` JWT, a `Cookie:` header, a Netscape
-  `cookies.txt`, or a JSON blob.
-- `acct1.txt` ships empty as a placeholder — paste your token into it (or add
-  more `acctN.txt` files) and restart the server, or call
-  `POST /reload-accounts`.
-- `accounts/` is **git-ignored**. Never remove that rule and never commit live
-  tokens. An empty `acct1.txt` is harmless; a filled one is a secret.
+**How to add your account:**
+
+1. Open `accounts/acct1.txt`. It currently contains the placeholder line
+   `PUT_YOUR_DEEPSEEK_USERTOKEN_HERE`.
+2. Replace that placeholder with your real `userToken` (a JWT starting with
+   `eyJ...`) — see [Getting your DeepSeek credentials](#getting-your-deepseek-credentials).
+   You can also paste a `Cookie:` header, a Netscape `cookies.txt`, or a JSON
+   blob instead; `parse_credentials` extracts the token automatically.
+3. Save the file. Restart the server, or call `POST /reload-accounts` to pick
+   it up without a restart.
+4. For more accounts, copy `acct1.txt` to `acct2.txt`, `acct3.txt`, … and put a
+   different token in each. The pool rotates between them.
+
+**What is tracked vs. secret:**
+
+- `accounts/` and the placeholder `acct1.txt` **are tracked** in git, so a
+  fresh clone already has the folder and the file to paste into.
+- Every other file in `accounts/` (e.g. a filled `acct2.txt`) is **git-ignored**
+  by the rules at the bottom of `.gitignore`:
+
+  ```gitignore
+  accounts/*
+  !accounts/.gitkeep
+  !accounts/acct1.txt
+  ```
+
+- ⚠️ Because `acct1.txt` itself is tracked, **never commit a real token in
+  `acct1.txt`**. Either keep it as the placeholder and use `acct2.txt`+ for
+  real tokens, or run `git update-index --skip-worktree accounts/acct1.txt` so
+  your local edit is never staged.
+- A filled credential file is a secret: anyone with it can use that DeepSeek
+  account. Never paste one into an issue, commit, or gist.
 
 #### Explicit paths
 

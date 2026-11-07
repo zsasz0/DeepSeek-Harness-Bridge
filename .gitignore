@@ -19,6 +19,11 @@ Thumbs.db
 *.swp
 .vscode/
 .idea/
-</
-# Live account tokens (never commit)
-accounts/
+
+# Live account tokens (never commit).
+# The folder itself and the empty acct1.txt placeholder ARE tracked,
+# so a fresh clone has somewhere to paste the token. Everything else
+# in accounts/ (real acctN.txt files) is ignored.
+accounts/*
+!accounts/.gitkeep
+!accounts/acct1.txt
