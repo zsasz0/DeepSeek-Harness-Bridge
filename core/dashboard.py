@@ -31,6 +31,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .a{margin-bottom:10px;white-space:pre-wrap;word-break:break-word}
   .row{display:flex;gap:8px}
   small{color:var(--muted)}
+  .acct{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;background:var(--code)}
+  .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
+  .dot.good{background:#3fb950;box-shadow:0 0 6px #3fb950}
+  .dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .dot.unknown{background:#d29922}
+  .acct .meta{flex:1;min-width:0}
+  .acct .name{font-size:13px;font-family:monospace}
+  .acct .msg{font-size:11px;color:var(--muted);word-break:break-word}
+  .pill{font-size:11px;padding:2px 8px;border-radius:10px;white-space:nowrap}
+  .pill.good{background:rgba(35,134,54,.2);color:#3fb950;border:1px solid var(--green)}
+  .pill.bad{background:rgba(248,81,73,.2);color:var(--red);border:1px solid #da3633}
+  .pill.warn{background:rgba(210,153,34,.2);color:#d29922;border:1px solid #d29922}
 </style>
 </head>
 <body>
@@ -48,6 +60,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div style="margin-top:8px">
         <button onclick="saveCreds()">Save &amp; Connect</button>
         <button class="alt" onclick="clearCreds()">Clear</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>&#128101; Accounts</h2>
+      <div id="accounts"><small>Loading...</small></div>
+      <div style="margin-top:10px">
+        <button onclick="refreshAccounts(true)">Re-check all</button>
+        <button class="alt" onclick="reloadAccounts()">Reload files</button>
       </div>
     </div>
     <div class="card">
@@ -141,6 +161,89 @@ async function checkStatus(){
     b.className = "badge bad";
     b.textContent = "\u25CF Server unreachable";
   }
+}
+
+function fmtAge(ts){
+  if (!ts) return "never";
+  const s = Math.max(0, Math.round(Date.now()/1000 - ts));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s/60) + "m ago";
+  return Math.round(s/3600) + "h ago";
+}
+
+function renderAccounts(list, checked){
+  const box = document.getElementById("accounts");
+  box.innerHTML = "";
+  if (!list.length){
+    box.innerHTML = '<small>No accounts loaded. Drop token files in <code>accounts/</code> and press Reload files.</small>';
+    return;
+  }
+  for (const a of list){
+    const row = document.createElement("div");
+    row.className = "acct";
+
+    const dot = document.createElement("span");
+    const state = a.valid === true ? "good" : a.valid === false ? "bad" : "unknown";
+    dot.className = "dot " + state;
+    row.appendChild(dot);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = a.id + "  \u00b7  " + (a.source || "?");
+    const msg = document.createElement("div");
+    msg.className = "msg";
+    let detail = a.valid_message || (a.valid === null ? "not checked yet" : "");
+    if (a.last_status) detail += (detail ? " \u00b7 " : "") + "last HTTP " + a.last_status;
+    if (a.cooling_for > 0) detail += (detail ? " \u00b7 " : "") + "cooling " + Math.ceil(a.cooling_for) + "s";
+    detail += (detail ? " \u00b7 " : "") + "checked " + fmtAge(a.checked_at);
+    msg.textContent = detail;
+    meta.appendChild(name);
+    meta.appendChild(msg);
+    row.appendChild(meta);
+
+    const pill = document.createElement("span");
+    if (a.valid === true) { pill.className = "pill good"; pill.textContent = "valid"; }
+    else if (a.valid === false) { pill.className = "pill bad"; pill.textContent = "invalid"; }
+    else { pill.className = "pill warn"; pill.textContent = "unknown"; }
+    row.appendChild(pill);
+
+    box.appendChild(row);
+  }
+  if (checked) {
+    const t = document.createElement("small");
+    t.textContent = "Checked " + new Date().toLocaleTimeString();
+    box.appendChild(t);
+  }
+}
+
+async function refreshAccounts(force){
+  const box = document.getElementById("accounts");
+  if (!box.querySelector(".acct")) box.innerHTML = '<small>Checking accounts...</small>';
+  try {
+    const r = await apiFetch("/v1/accounts" + (force ? "?validate=1" : ""), {method: force ? "POST" : "GET"});
+    const d = await r.json();
+    renderAccounts(d.data || [], force);
+    const ready = (d.data || []).filter(a => a.valid === true).length;
+    const b = document.getElementById("badge");
+    if (ready > 0) {
+      b.className = "badge ok";
+      b.textContent = "\u25CF " + ready + "/" + d.data.length + " accounts valid";
+    } else {
+      b.className = "badge bad";
+      b.textContent = "\u25CF No valid accounts";
+    }
+  } catch(e) {
+    box.innerHTML = '<small>Could not load accounts: ' + e.message + '</small>';
+  }
+}
+
+async function reloadAccounts(){
+  try {
+    await apiFetch("/reload-accounts", {method: "POST"});
+  } catch(e) {}
+  refreshAccounts(true);
 }
 
 async function saveCreds(){
@@ -237,6 +340,8 @@ async function send(){
 }
 
 checkStatus();
+refreshAccounts(true);
+setInterval(() => refreshAccounts(false), 60000);
 </script>
 </body>
 </html>

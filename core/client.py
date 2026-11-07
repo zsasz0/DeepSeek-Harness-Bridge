@@ -10,7 +10,7 @@ from typing import Any, Dict, Generator, List, Optional
 
 from curl_cffi import requests, CurlMime
 
-from .auth import AuthManager
+from .auth import AuthManager, IMPERSONATE
 from .pow_solver import PoWSolver
 
 DEEPSEEK_BASE = "https://chat.deepseek.com"
@@ -70,7 +70,7 @@ class DeepSeekWebClient:
         self.pow_solver = PoWSolver()
 
     def _new_session(self) -> requests.Session:
-        return requests.Session(impersonate="chrome124")
+        return requests.Session(impersonate=IMPERSONATE)
 
     def _resolve_headers(self, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
         """Use per-account headers when provided, else the manager's."""

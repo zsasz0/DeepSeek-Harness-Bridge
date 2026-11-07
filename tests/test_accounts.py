@@ -101,7 +101,7 @@ class HeaderTests(unittest.TestCase):
         headers = build_headers(token=JWT_A, cookie_string="a=b")
         self.assertEqual(headers["x-client-version"], "2.0.0")
         self.assertEqual(headers["x-app-version"], "2.0.0")
-        self.assertIn("Chrome/149", headers["User-Agent"])
+        self.assertRegex(headers["User-Agent"], r"Chrome/1[4-9][0-9]\.0\.0\.0")
         self.assertEqual(headers["Authorization"], f"Bearer {JWT_A}")
         self.assertEqual(headers["Cookie"], "a=b")
 

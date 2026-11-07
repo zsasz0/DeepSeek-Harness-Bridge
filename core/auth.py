@@ -20,6 +20,32 @@ from curl_cffi import requests
 DEEPSEEK_BASE = "https://chat.deepseek.com"
 CURRENT_USER_URL = f"{DEEPSEEK_BASE}/api/v0/users/current"
 
+
+def _resolve_impersonate() -> str:
+    """Pick a curl_cffi impersonation target available in this install."""
+    target = os.environ.get("DEEPSEEK_IMPERSONATE", "").strip() or "chrome150"
+    try:
+        from curl_cffi.requests import BrowserType
+
+        available = {browser.value for browser in BrowserType}
+    except Exception:
+        available = set()
+    if available and target not in available:
+        numbered = [t for t in available if re.fullmatch(r"chrome\d+", t)]
+        if numbered:
+            target = max(numbered, key=lambda t: int(t[6:]))
+        elif "chrome" in available:
+            target = "chrome"
+    return target
+
+
+IMPERSONATE = _resolve_impersonate()
+
+
+def _target_version(target: str) -> str:
+    match = re.search(r"chrome(\d+)", target or "")
+    return match.group(1) if match else "124"
+
 # JWT = header.payload.signature, all base64url segments.
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+")
 _COOKIE_PAIR_RE = re.compile(r"([A-Za-z0-9_\-.]+)=([^;,\s\r\n]+)")
@@ -42,6 +68,7 @@ def build_headers(
     token: Optional[str] = None, cookie_string: Optional[str] = None
 ) -> Dict[str, str]:
     """Browser-like headers required by DeepSeek's web API."""
+    version = _target_version(IMPERSONATE)
     headers = {
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -49,7 +76,10 @@ def build_headers(
         "DNT": "1",
         "Origin": DEEPSEEK_BASE,
         "Referer": f"{DEEPSEEK_BASE}/",
-        "Sec-Ch-Ua": '"Chromium";v="149", "Not)A;Brand";v="24", "Google Chrome";v="149"',
+        "Sec-Ch-Ua": (
+            f'"Chromium";v="{version}", "Not)A;Brand";v="24", '
+            f'"Google Chrome";v="{version}"'
+        ),
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
@@ -57,7 +87,7 @@ def build_headers(
         "Sec-Fetch-Site": "same-origin",
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+            f"(KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36"
         ),
         "x-app-version": "2.0.0",
         "x-client-locale": "en_US",
@@ -105,6 +135,20 @@ def parse_credentials(raw_text: str) -> Tuple[Optional[str], str]:
     is_netscape = any(
         "\t" in line for line in lines if line and not line.startswith("#")
     )
+
+    # 2b. Bare opaque token: DeepSeek also issues 64-char base64 tokens that
+    # are not JWTs. A single line with no whitespace and no cookie syntax is
+    # treated as the token itself. Skipped for Netscape files, which contain
+    # tabs and would otherwise never match.
+    if not token and not is_netscape:
+        stripped = raw.strip()
+        if (
+            "\n" not in stripped
+            and "=" not in stripped
+            and " " not in stripped
+            and 20 <= len(stripped) <= 2000
+        ):
+            token = stripped
 
     if is_netscape:
         # 3. Netscape cookies.txt format: domain, flag, path, secure,
@@ -222,7 +266,7 @@ class AuthManager:
 
         headers = self.get_headers(token=target_token, cookie_string=target_cookie)
         try:
-            session = requests.Session(impersonate="chrome124")
+            session = requests.Session(impersonate=IMPERSONATE)
             resp = session.get(CURRENT_USER_URL, headers=headers, timeout=10)
         except Exception as exc:
             return False, None, f"Connection error validating session: {exc}"

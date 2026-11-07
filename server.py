@@ -178,6 +178,7 @@ async def health_check() -> Dict[str, Any]:
         "time": time.time(),
         "accounts": len(pool),
         "accounts_ready": sum(1 for account in pool if account["ready"]),
+        "accounts_valid": sum(1 for account in pool if account["valid"] is True),
     }
 
 
@@ -241,9 +242,16 @@ async def list_accounts() -> Dict[str, Any]:
     return {"object": "list", "data": accounts.status()}
 
 
+@app.post("/v1/accounts")
+async def validate_accounts() -> Dict[str, Any]:
+    """Check every account live. Used by the dashboard's Re-check button."""
+    return {"object": "list", "data": accounts.validate_all(force=True)}
+
+
 @app.post("/reload-accounts")
 async def reload_accounts() -> Dict[str, Any]:
-    return {"accounts": accounts.reload()}
+    count = accounts.reload()
+    return {"accounts": count, "data": accounts.status()}
 
 
 @app.post("/reset-session")

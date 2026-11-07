@@ -22,10 +22,19 @@ def open_browser(url: str, delay: float = 1.5) -> None:
 
 def main() -> None:
     auth = AuthManager()
-    if auth.token:
+
+    # Point the pool at the in-project accounts folder unless overridden.
+    accounts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
+    if not os.environ.get("DEEPSEEK_AUTH_DIR") and os.path.isdir(accounts_dir):
+        os.environ["DEEPSEEK_AUTH_DIR"] = accounts_dir
+
+    if os.environ.get("DEEPSEEK_AUTH_DIR") or os.environ.get("DEEPSEEK_AUTH_PATH"):
+        print(
+            "[ok] Account pool: "
+            + (os.environ.get("DEEPSEEK_AUTH_DIR") or os.environ.get("DEEPSEEK_AUTH_PATH"))
+        )
+    elif auth.token:
         print(f"[ok] Loaded credentials from {auth.config_path}")
-    elif os.environ.get("DEEPSEEK_AUTH_DIR") or os.environ.get("DEEPSEEK_AUTH_PATH"):
-        print("[ok] Using account pool from environment")
     else:
         print("[!] No credentials found. Open the dashboard to paste your userToken.")
 

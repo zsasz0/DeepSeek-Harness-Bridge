@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from .auth import AuthManager, build_headers, parse_credentials
+from .auth import requests as _requests
+from .auth import CURRENT_USER_URL
 
 # Cooldowns (seconds).
 AUTH_FAILURE_COOLDOWN = 30 * 60  # 401/403: the token itself is bad
@@ -43,6 +45,9 @@ class Account:
     last_used: float = 0.0
     last_status: Optional[int] = None
     source: str = ""
+    valid: Optional[bool] = None
+    valid_message: str = ""
+    checked_at: float = 0.0
 
     def headers(self) -> Dict[str, str]:
         return build_headers(token=self.token, cookie_string=self.cookie)
@@ -63,6 +68,9 @@ class Account:
             "failures": self.failures,
             "last_status": self.last_status,
             "last_used": self.last_used or None,
+            "valid": self.valid,
+            "valid_message": self.valid_message,
+            "checked_at": self.checked_at or None,
         }
 
 
@@ -78,9 +86,18 @@ class AccountPool:
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+    def _project_accounts_dir(self) -> Optional[str]:
+        """``<project>/accounts`` next to ``core/``, when it exists."""
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate = os.path.join(base, "accounts")
+        return candidate if os.path.isdir(candidate) else None
+
     def _credential_paths(self) -> List[str]:
         paths: List[str] = []
         directory = os.environ.get("DEEPSEEK_AUTH_DIR", "").strip()
+        if not directory or not os.path.isdir(directory):
+            # No env var: fall back to the in-project accounts folder.
+            directory = self._project_accounts_dir() or ""
         if directory and os.path.isdir(directory):
             for pattern in ("*.json", "*.txt"):
                 paths.extend(sorted(glob.glob(os.path.join(directory, pattern))))
@@ -227,6 +244,59 @@ class AccountPool:
                 return 0.0
             waits = [a.cooling_for for a in accounts]
             return round(min(waits), 1) if waits else 0.0
+
+    # ------------------------------------------------------------------
+    # Validity probes
+    # ------------------------------------------------------------------
+    def validate_all(self, force: bool = False, max_age: float = 300.0) -> List[Dict[str, object]]:
+        """Check every account against ``/api/v0/users/current``.
+
+        Results are cached for ``max_age`` seconds unless ``force`` is set, so
+        the dashboard can poll without hammering DeepSeek.
+        """
+        with self._lock:
+            accounts = self._all()
+
+        now = time.time()
+        for account in accounts:
+            if (
+                not force
+                and account.checked_at
+                and now - account.checked_at < max_age
+            ):
+                continue
+            try:
+                session = _requests.Session(impersonate="chrome124")
+                resp = session.get(
+                    CURRENT_USER_URL,
+                    headers=account.headers(),
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    account.valid = False
+                    account.valid_message = f"HTTP {resp.status_code}"
+                else:
+                    body = resp.json()
+                    code = body.get("code")
+                    if code == 0:
+                        account.valid = True
+                        info = body.get("data") or {}
+                        account.valid_message = (
+                            info.get("nickname")
+                            or info.get("email")
+                            or "valid"
+                        )
+                    else:
+                        account.valid = False
+                        account.valid_message = (
+                            f"{body.get('msg', 'invalid')} (code: {code})"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                account.valid = False
+                account.valid_message = f"check failed: {exc}"
+            account.checked_at = time.time()
+
+        return self.status()
 
 
 def build_pool(auth_manager: Optional[AuthManager] = None) -> AccountPool:
