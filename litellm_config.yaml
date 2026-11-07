@@ -1,0 +1,25 @@
+# Optional: one OpenAI-compatible front door for every harness.
+#
+#   pip install 'litellm[proxy]'
+#   litellm --config litellm_config.yaml --port 4000
+#
+# Then point opencode / Cline / Continue / Aider at:
+#   baseURL = http://localhost:4000
+#   model   = deepseek-web
+#
+# Claude Code talks Anthropic, LiteLLM translates:
+#   ANTHROPIC_BASE_URL=http://localhost:4000
+#   ANTHROPIC_AUTH_TOKEN=sk-litellm
+#   ANTHROPIC_MODEL=deepseek-web
+#
+# LiteLLM only forwards -- it does not parse tool calls. core/envelope.py does.
+
+model_list:
+  - model_name: deepseek-web
+    litellm_params:
+      model: openai/deepseek-web
+      api_base: http://localhost:8084/v1
+      api_key: "dummy"
+
+litellm_settings:
+  drop_params: true
