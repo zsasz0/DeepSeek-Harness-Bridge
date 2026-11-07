@@ -20,3 +20,5 @@ Thumbs.db
 .vscode/
 .idea/
 </
+# Live account tokens (never commit)
+accounts/
