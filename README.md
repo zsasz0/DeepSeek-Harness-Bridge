@@ -240,6 +240,8 @@ for chunk in stream:
 
 ### OpenCode
 
+![OpenCode using DeepSeek Web2API](docs/opencode-preview.png)
+
 Add this provider to your OpenCode config
 (`~/.config/opencode/opencode.json` on Linux/macOS,
 `%APPDATA%\opencode\opencode.json` on Windows):
