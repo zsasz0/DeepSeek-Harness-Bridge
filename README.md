@@ -371,12 +371,41 @@ Credentials are read from `config.json` in the project root:
 ```
 
 `config.json` and `cookie_deepseek.txt` are **git-ignored**. A safe template
-lives in `config.example.json`.
+lives in `config.example.json` — copy it to `config.json` and fill in your own
+values, or just use the dashboard.
 
 ### Multi-account
 
-Point `DEEPSEEK_AUTH_DIR` at a folder of credential files (any mix of JSON,
-cookie strings or Netscape `cookies.txt`), or list explicit paths:
+#### In-project `accounts/` folder (default)
+
+The easiest setup: create an `accounts/` folder next to `main.py` and drop one
+credential file per account into it. `main.py` points the pool at this folder
+automatically when it exists, so no environment variable is needed:
+
+```text
+deepseek-webApi2-v1-json/
+├── accounts/
+│   ├── acct1.txt
+│   ├── acct2.txt
+│   └── ...
+├── core/
+├── main.py
+└── ...
+```
+
+- Each file holds **one** credential, in any format `parse_credentials`
+  understands: a bare `userToken` JWT, a `Cookie:` header, a Netscape
+  `cookies.txt`, or a JSON blob.
+- `acct1.txt` ships empty as a placeholder — paste your token into it (or add
+  more `acctN.txt` files) and restart the server, or call
+  `POST /reload-accounts`.
+- `accounts/` is **git-ignored**. Never remove that rule and never commit live
+  tokens. An empty `acct1.txt` is harmless; a filled one is a secret.
+
+#### Explicit paths
+
+Point `DEEPSEEK_AUTH_DIR` at a folder of credential files, or list explicit
+paths with `DEEPSEEK_AUTH_PATH` (this overrides the in-project folder):
 
 ```bash
 DEEPSEEK_AUTH_DIR=C:\deepseek-accounts
@@ -384,10 +413,13 @@ DEEPSEEK_AUTH_DIR=C:\deepseek-accounts
 DEEPSEEK_AUTH_PATH=C:\a.json,C:\b.txt
 ```
 
-Behaviour: an agent stays on its account while it is healthy; when an account
-returns 401/403 it cools down for 30 min, and 429 / `Too many messages` uses
+#### Rotation behaviour
+
+An agent stays on its account while it is healthy; when an account returns
+401/403 it cools down for 30 min, and 429 / `Too many messages` uses
 `Retry-After` (default 60 s). If every account is cooling, the request gets
-HTTP 429 with a `Retry-After` header.
+HTTP 429 with a `Retry-After` header. Inspect the pool at `GET /v1/accounts`
+or in the dashboard.
 
 ### Environment variables
 
@@ -432,6 +464,36 @@ HTTP 429 with a `Retry-After` header.
 | `pip install` fails on Linux | Install `python3-venv` (`sudo apt install python3-venv`). |
 | `wasmtime` install error | Use Python 3.10–3.12; ensure wheels are available for your platform. |
 | Browser doesn't open | Headless server — just visit the URL manually. |
+
+---
+
+## Concurrency notes
+
+Parallel use works, with one caveat: the same `x-agent-session` must not be
+used by two requests at the same time. Distinct agent ids are fully parallel;
+the same agent id in parallel can interleave session state.
+
+| Scenario | State |
+|---|---|
+| N agents, distinct ids, parallel | Works |
+| N agents, same account, parallel | Works, higher upstream rate-limit risk |
+| Same agent id, parallel | Not safe — session state can interleave |
+| PoW under parallelism | Safe (serialized by `_SOLVER_LOCK`) |
+
+Known unguarded spots (documented, not yet fixed):
+
+- `server.py` `create_chat_completion()` runs an unguarded
+  `plan()` → `create_chat_session()` → `mark_sent()` sequence on one
+  `AgentSession`.
+- `core/sessions.py` `AgentSession.mark_sent()` mutates counters and history
+  without a lock.
+- `core/accounts.py` `note_used()` / `mark_failure()` mutate the shared
+  `Account` outside `AccountPool._lock`.
+
+The proposed fix shape is a per-`AgentSession` lock held from `plan()` through
+`mark_sent()`, and moving account mutations under the pool lock. Until then,
+give each concurrent request its own `x-agent-session` value. Full review notes
+live in `docs/concurrency-notes.md`.
 
 ---
 
