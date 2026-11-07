@@ -132,14 +132,14 @@ async function checkStatus(){
     const d = await r.json();
     if (d.authenticated) {
       b.className = "badge ok";
-      b.textContent = "\\u25CF Connected";
+      b.textContent = "\u25CF Connected";
     } else {
       b.className = "badge bad";
-      b.textContent = "\\u25CF " + (d.message || "Disconnected");
+      b.textContent = "\u25CF " + (d.message || "Disconnected");
     }
   } catch(e) {
     b.className = "badge bad";
-    b.textContent = "\\u25CF Server unreachable";
+    b.textContent = "\u25CF Server unreachable";
   }
 }
 
@@ -203,7 +203,7 @@ async function send(){
       const {done, value} = await reader.read();
       if (done) break;
       buf += dec.decode(value, {stream:true});
-      const lines = buf.split("\\n");
+      const lines = buf.split("\n");
       buf = lines.pop();
       for (const line of lines) {
         const t = line.trim();
@@ -212,12 +212,22 @@ async function send(){
         if (data === "[DONE]") continue;
         try {
           const j = JSON.parse(data);
+          if (j.error) {
+            a.textContent = "Error: " + (j.error.message || JSON.stringify(j.error));
+            a.style.color = "#ff7b72";
+            a.style.whiteSpace = "pre-wrap";
+            continue;
+          }
           const d = j.choices?.[0]?.delta || {};
           if (d.content) a.textContent += d.content;
           if (d.reasoning_content) a.textContent += d.reasoning_content;
         } catch(e){}
       }
       chat.scrollTop = chat.scrollHeight;
+    }
+    if (!a.textContent.trim()) {
+      a.textContent = "No response (empty stream)";
+      a.style.color = "#ffb86b";
     }
   } catch(e) {
     a.textContent = "Connection error: " + e.message;
