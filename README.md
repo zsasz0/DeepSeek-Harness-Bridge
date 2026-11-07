@@ -7,6 +7,8 @@ Runs a small FastAPI server on `http://localhost:8084` that speaks the OpenAI
 using your own logged-in session. Works with any OpenAI-compatible client
 (OpenCode, Cursor, Continue, LiteLLM, the OpenAI Python/JS SDK, etc.).
 
+![DeepSeek Web2API dashboard](docs/dashboard.png)
+
 > ⚠️ **Disclaimer** — This project is unofficial and not affiliated with
 > DeepSeek. It relies on private web endpoints and may break at any time.
 > Use it for personal experimentation only and respect DeepSeek's Terms of
