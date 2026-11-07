@@ -1,26 +1,28 @@
 """
 DeepSeek Web2API v2 - OpenAI-compatible server.
 
-Exposes /v1/chat/completions and /v1/models with tolerant tool-call parsing
-and true token streaming. The dashboard lives in ``dashboard.py``.
+Exposes /v1/chat/completions and /v1/models with tolerant tool-call parsing,
+true token streaming (no-tools requests) and per-agent session reuse. The
+dashboard lives in ``dashboard.py``.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import os
 import time
-import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
+from core.accounts import build_pool
 from core.auth import AuthManager
-from core.client import DeepSeekWebClient
+from core.client import DeepSeekWebClient, HTTPStatusError
 from core.dashboard import DASHBOARD_HTML
 from core.openai_adapter import (
     AVAILABLE_MODELS,
@@ -32,9 +34,11 @@ from core.openai_adapter import (
     resolve_model_search,
     resolve_model_thinking,
 )
+from core.sessions import sessions as agent_sessions
 
 auth_manager = AuthManager()
 client = DeepSeekWebClient(auth_manager)
+accounts = build_pool(auth_manager)
 
 _EXT_BY_MIME = {
     "image/png": "png",
@@ -46,18 +50,26 @@ _EXT_BY_MIME = {
 }
 
 
-def _upload_image(url: str, session=None) -> str:
-    if url.startswith("data:"):
-        header, _, b64 = url.partition(",")
-        mime = header[5:].split(";")[0] or "image/png"
+def _upload_image(url: str, session=None, headers=None) -> Optional[str]:
+    """Upload an inline image to DeepSeek.
+
+    Only ``data:`` URIs are accepted. Remote URLs are never fetched: doing so
+    would let any client turn this proxy into an SSRF gadget against internal
+    hosts, cloud metadata endpoints or local services.
+    """
+    if not url.startswith("data:"):
+        print("[upload] skipping non-inline image url (SSRF protection)")
+        return None
+    header, _, b64 = url.partition(",")
+    mime = header[5:].split(";")[0] or "image/png"
+    try:
         data = base64.b64decode(b64)
-    else:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
-            mime = resp.headers.get_content_type() or "image/png"
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"invalid base64 image payload: {exc}") from exc
     ext = _EXT_BY_MIME.get(mime, "png")
-    return client.upload_file(data, "image." + ext, mime, session=session)
+    return client.upload_file(
+        data, "image." + ext, mime, session=session, headers=headers
+    )
 
 
 def _collect_images(messages: List[Dict[str, Any]]) -> List[str]:
@@ -89,14 +101,54 @@ def _collect_images(messages: List[Dict[str, Any]]) -> List[str]:
         return urls
     return []
 
+
 app = FastAPI(title="DeepSeek Web2API", version="2.0.0")
+
+# Only loopback origins are allowed by default; add explicit ones via
+# PROXY_CORS_ORIGINS=https://ui.example.com,http://192.168.1.20:3000
+_DEFAULT_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+]
+_extra_origins = [
+    origin.strip()
+    for origin in os.environ.get("PROXY_CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_DEFAULT_ORIGINS + _extra_origins,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional client authentication. When PROXY_API_KEY is set, every endpoint
+# except health checks requires a matching bearer token.
+PROXY_API_KEY = os.environ.get("PROXY_API_KEY", "").strip()
+_OPEN_PATHS = {"/health", "/readyz"}
+
+
+@app.middleware("http")
+async def require_proxy_key(request, call_next):
+    if not PROXY_API_KEY:
+        return await call_next(request)
+    if request.url.path in _OPEN_PATHS:
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    key = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if not key:
+        key = request.headers.get("x-api-key", "").strip()
+    if key != PROXY_API_KEY:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"error": {"message": "unauthorized", "type": "authentication_error"}},
+            status_code=401,
+        )
+    return await call_next(request)
 
 
 class CookieUpdateRequest(BaseModel):
@@ -120,7 +172,24 @@ class ChatCompletionRequest(BaseModel):
 # ----------------------------------------------------------------------
 @app.get("/health")
 async def health_check() -> Dict[str, Any]:
-    return {"status": "ok", "time": time.time()}
+    pool = accounts.status()
+    return {
+        "status": "ok",
+        "time": time.time(),
+        "accounts": len(pool),
+        "accounts_ready": sum(1 for account in pool if account["ready"]),
+    }
+
+
+@app.get("/readyz")
+async def ready_check() -> Dict[str, Any]:
+    pool = accounts.status()
+    ready = sum(1 for account in pool if account["ready"])
+    return {
+        "status": "ok" if ready else "degraded",
+        "accounts": len(pool),
+        "ready": ready,
+    }
 
 
 @app.get("/api/status")
@@ -160,6 +229,26 @@ async def update_cookies(req: CookieUpdateRequest) -> Dict[str, Any]:
 @app.get("/v1/models")
 async def list_models() -> Dict[str, Any]:
     return {"object": "list", "data": AVAILABLE_MODELS}
+
+
+@app.get("/v1/sessions")
+async def list_sessions() -> Dict[str, Any]:
+    return {"object": "list", "data": agent_sessions.list_public()}
+
+
+@app.get("/v1/accounts")
+async def list_accounts() -> Dict[str, Any]:
+    return {"object": "list", "data": accounts.status()}
+
+
+@app.post("/reload-accounts")
+async def reload_accounts() -> Dict[str, Any]:
+    return {"accounts": accounts.reload()}
+
+
+@app.post("/reset-session")
+async def reset_session(agent: str = "all") -> Dict[str, Any]:
+    return {"agent": agent, "reset": agent_sessions.reset(agent)}
 
 
 # ----------------------------------------------------------------------
@@ -210,19 +299,43 @@ def make_usage_chunk(
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
-def _collect(events) -> tuple[str, str, bool]:
-    """Consume client events and return (text, thinking, errored)."""
+def _collect(events) -> tuple[str, str, Optional[str]]:
+    """Consume client events and return (text, thinking, message_id).
+
+    Upstream HTTP failures are raised as :class:`HTTPStatusError` so the
+    account pool can read the status and ``Retry-After`` value.
+    """
     text_parts: List[str] = []
     thinking_parts: List[str] = []
+    message_id: Optional[str] = None
+    http_status: Optional[int] = None
+    retry_after: Optional[float] = None
+    error_message: Optional[str] = None
+
     for event in events:
         kind = event.get("type")
+        if kind == "http_error":
+            http_status = event.get("status")
+            retry_after = event.get("retry_after")
+            continue
         if kind == "error":
-            raise RuntimeError(event.get("message", "DeepSeek stream error"))
+            error_message = event.get("message", "DeepSeek stream error")
+            continue
         if kind == "text":
             text_parts.append(event.get("content", ""))
         elif kind == "thinking":
             thinking_parts.append(event.get("content", ""))
-    return "".join(text_parts), "".join(thinking_parts), False
+        elif kind == "message_id":
+            message_id = event.get("id") or message_id
+
+    if http_status:
+        raise HTTPStatusError(
+            error_message or f"HTTP {http_status}", http_status, retry_after
+        )
+    if error_message:
+        raise RuntimeError(error_message)
+
+    return "".join(text_parts), "".join(thinking_parts), message_id
 
 
 # ----------------------------------------------------------------------
@@ -275,14 +388,16 @@ def _generate(
     search_enabled: bool,
     ref_file_ids: List[str],
     tools: Optional[List[Dict[str, Any]]],
-) -> tuple[str, List[Dict[str, Any]], str, str]:
+    parent_message_id: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> tuple[str, List[Dict[str, Any]], str, str, Optional[str]]:
     """Collect one reply, retrying once when a tool-call attempt fails to parse.
 
-    Returns ``(content, tool_calls, thinking, raw_text)``. Raises
+    Returns ``(content, tool_calls, thinking, raw_text, message_id)``. Raises
     ``HTTPException(502)`` when the model clearly attempted a tool call and
     neither the first reply nor the self-correction retry could be parsed.
     """
-    text, thinking, _ = _collect(
+    text, thinking, message_id = _collect(
         client.stream_chat(
             prompt=prompt,
             session_id=session_id,
@@ -290,13 +405,15 @@ def _generate(
             thinking_enabled=thinking_enabled,
             search_enabled=search_enabled,
             ref_file_ids=ref_file_ids,
+            parent_message_id=parent_message_id,
+            headers=headers,
         )
     )
     content, calls, attempted = parse_envelope_tool_calls(text, tools)
 
     if not calls and attempted and tools:
         print("[chat] tool-call parse failed; retrying with self-correction")
-        text2, thinking2, _ = _collect(
+        text2, thinking2, message_id2 = _collect(
             client.stream_chat(
                 prompt=_retry_prompt(prompt, text, tools),
                 session_id=session_id,
@@ -304,10 +421,14 @@ def _generate(
                 thinking_enabled=thinking_enabled,
                 search_enabled=search_enabled,
                 ref_file_ids=ref_file_ids,
+                # Thread the correction after the reply we just received.
+                parent_message_id=message_id or parent_message_id,
+                headers=headers,
             )
         )
         content, calls, attempted = parse_envelope_tool_calls(text2, tools)
         thinking = thinking or thinking2
+        message_id = message_id2 or message_id
         if text2:
             text = text2
 
@@ -325,38 +446,122 @@ def _generate(
             status_code=502, detail="DeepSeek returned an empty response"
         )
 
-    return content, calls, thinking, text
+    return content, calls, thinking, text, message_id
+
+
+def _assistant_message(
+    content: Optional[str],
+    thinking: Optional[str],
+    tool_calls: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    message: Dict[str, Any] = {"role": "assistant", "content": content or None}
+    if thinking:
+        message["reasoning_content"] = thinking
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _account_failure(agent, account, exc: HTTPStatusError) -> HTTPException:
+    """Cool the account down, detach the chat and build a client-facing error."""
+    cooldown = accounts.mark_failure(
+        account,
+        exc.status_code,
+        getattr(exc, "retry_after", None),
+        str(exc),
+    )
+    agent.reset_remote()
+    lowered = str(exc).lower()
+    if exc.status_code in (401, 403):
+        status = exc.status_code
+    elif exc.status_code == 429 or "too many messages" in lowered:
+        # DeepSeek reports rate limits as HTTP 400 + "Too many messages".
+        status = 429
+    else:
+        status = 502
+    return HTTPException(
+        status_code=status,
+        detail=str(exc),
+        headers={"Retry-After": str(max(1, int(cooldown)))},
+    )
 
 
 @app.post("/v1/chat/completions")
-def create_chat_completion(req: ChatCompletionRequest):
-    if not auth_manager.token:
+def create_chat_completion(
+    req: ChatCompletionRequest,
+    x_agent_session: Optional[str] = Header(default=None, alias="x-agent-session"),
+    session_header: Optional[str] = Header(default=None, alias="session"),
+    user: Optional[str] = Header(default=None),
+):
+    if accounts.size() == 0:
         raise HTTPException(
             status_code=401,
             detail="DeepSeek session not configured. Open http://localhost:8084 to set your token.",
         )
 
-    prompt = format_messages_to_prompt(req.messages, tools=req.tools)
+    def _hdr(value: Any) -> Optional[str]:
+        # When the handler is called directly (tests), FastAPI has not resolved
+        # Header defaults yet, so they arrive as Header() objects.
+        return value if isinstance(value, str) and value else None
+
+    agent_id = (
+        _hdr(x_agent_session) or _hdr(session_header) or _hdr(user) or "default"
+    )
+    agent = agent_sessions.get(agent_id)
+
+    account = accounts.select(agent_id, agent.account_id)
+    if account is None:
+        wait = accounts.next_ready_in()
+        raise HTTPException(
+            status_code=429,
+            detail="All DeepSeek accounts are rate limited. Retry later.",
+            headers={"Retry-After": str(max(1, int(wait)))},
+        )
+    if agent.account_id and agent.account_id != account.id:
+        # The live chat session belongs to a different account; it cannot be
+        # continued with this one.
+        agent.reset_remote()
+    agent.account_id = account.id
+    headers = account.headers()
+
+    delta_messages, reset_reason = agent.plan(req.messages, req.tools)
+
+    prompt = format_messages_to_prompt(delta_messages, tools=req.tools)
     image_urls = _collect_images(req.messages)
     if not prompt and not image_urls:
         raise HTTPException(status_code=400, detail="Empty prompt / messages.")
 
     session = client._new_session()
-    chat_session_id = client.create_chat_session(session)
+    if reset_reason or not agent.chat_session_id:
+        if reset_reason:
+            print(f"[session:{agent_id}] reset: {reset_reason}")
+            agent.reset_remote()
+        try:
+            chat_session_id = client.create_chat_session(session, headers=headers)
+        except HTTPStatusError as exc:
+            raise _account_failure(agent, account, exc) from exc
+        agent.chat_session_id = chat_session_id
+        parent_message_id = None
+    else:
+        chat_session_id = agent.chat_session_id
+        parent_message_id = agent.parent_message_id
 
     ref_file_ids: List[str] = []
     for image_url in image_urls:
         try:
-            ref_file_ids.append(_upload_image(image_url, session=session))
+            file_id = _upload_image(image_url, session=session, headers=headers)
+        except HTTPStatusError as exc:
+            raise _account_failure(agent, account, exc) from exc
         except Exception as exc:  # noqa: BLE001
             print("UPLOAD ERROR:", exc)
             raise HTTPException(
                 status_code=502, detail=f"Image upload failed: {exc}"
             ) from exc
+        if file_id:
+            ref_file_ids.append(file_id)
 
     if ref_file_ids:
-        import time as _time
-        _time.sleep(2)
+        time.sleep(2)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     thinking_enabled = (
@@ -372,8 +577,150 @@ def create_chat_completion(req: ChatCompletionRequest):
 
     prompt_tokens = _count_message_tokens(req.messages)
 
+    # Hybrid streaming (option A): when the request has no tools, forward the
+    # reply live. With tools we must buffer the whole reply to parse the JSON
+    # envelope before we can emit proper tool-call deltas.
+    if req.stream and not req.tools:
+        want_usage_live = bool(
+            req.stream_options and req.stream_options.get("include_usage")
+        )
+
+        def live_event_stream():
+            emitted_role = False
+            text_parts: List[str] = []
+            thinking_parts: List[str] = []
+            message_id: Optional[str] = None
+            finished = False
+            try:
+                for event in client.stream_chat(
+                    prompt=prompt,
+                    session_id=chat_session_id,
+                    session=session,
+                    thinking_enabled=thinking_enabled,
+                    search_enabled=search_enabled,
+                    ref_file_ids=ref_file_ids,
+                    parent_message_id=parent_message_id,
+                    headers=headers,
+                ):
+                    kind = event.get("type")
+                    if kind == "message_id":
+                        message_id = event.get("id") or message_id
+                        continue
+                    if kind == "http_error":
+                        status = event.get("status")
+                        cooldown = accounts.mark_failure(
+                            account,
+                            status,
+                            event.get("retry_after"),
+                            "",
+                        )
+                        agent.reset_remote()
+                        err = {
+                            "error": {
+                                "message": f"DeepSeek upstream HTTP {status}",
+                                "type": (
+                                    "rate_limit_error"
+                                    if status == 429
+                                    else "authentication_error"
+                                    if status in (401, 403)
+                                    else "upstream_error"
+                                ),
+                                "retry_after": max(1, int(cooldown)),
+                            }
+                        }
+                        yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                        yield make_done_sse()
+                        return
+                    if kind == "error":
+                        # Headers are already sent: report inside the stream.
+                        err = {
+                            "error": {
+                                "message": event.get("message", "DeepSeek stream error"),
+                                "type": "upstream_error",
+                            }
+                        }
+                        yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                        yield make_done_sse()
+                        return
+                    if kind == "thinking":
+                        chunk = event.get("content", "")
+                        if chunk:
+                            thinking_parts.append(chunk)
+                            yield make_chunk_sse(
+                                completion_id, req.model, {"reasoning_content": chunk}
+                            )
+                    elif kind == "text":
+                        chunk = event.get("content", "")
+                        if chunk:
+                            text_parts.append(chunk)
+                            delta: Dict[str, Any] = {"content": chunk}
+                            if not emitted_role:
+                                delta = {"role": "assistant", **delta}
+                                emitted_role = True
+                            yield make_chunk_sse(completion_id, req.model, delta)
+
+                full_text = "".join(text_parts)
+                if not emitted_role and not full_text.strip():
+                    err = {
+                        "error": {
+                            "message": "DeepSeek returned an empty response",
+                            "type": "upstream_error",
+                        }
+                    }
+                    yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                    yield make_done_sse()
+                    finished = True
+                    return
+
+                if not emitted_role:
+                    yield make_chunk_sse(
+                        completion_id,
+                        req.model,
+                        {"role": "assistant", "content": ""},
+                    )
+                yield make_chunk_sse(
+                    completion_id, req.model, {}, finish_reason="stop"
+                )
+                if want_usage_live:
+                    yield make_usage_chunk(
+                        completion_id,
+                        req.model,
+                        prompt_tokens,
+                        _estimate_tokens(full_text),
+                    )
+                yield make_done_sse()
+                finished = True
+                accounts.note_used(account)
+            except Exception as exc:  # noqa: BLE001 - headers already sent
+                print("STREAM ERROR:", exc)
+                agent.reset_remote()
+                err = {
+                    "error": {
+                        "message": str(exc),
+                        "type": "upstream_error",
+                    }
+                }
+                yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                yield make_done_sse()
+            finally:
+                # Record the turn only when the upstream exchange finished.
+                if finished:
+                    full_text = "".join(text_parts)
+                    if full_text.strip():
+                        agent.mark_sent(
+                            sent_messages=delta_messages,
+                            tools=req.tools,
+                            prompt_chars=len(prompt),
+                            output_chars=len(full_text) + len("".join(thinking_parts)),
+                            message_id=message_id,
+                        )
+
+        return StreamingResponse(
+            live_event_stream(), media_type="text/event-stream"
+        )
+
     try:
-        content, tool_calls, thinking, raw_text = _generate(
+        content, tool_calls, thinking, raw_text, message_id = _generate(
             prompt=prompt,
             session=session,
             session_id=chat_session_id,
@@ -381,12 +728,29 @@ def create_chat_completion(req: ChatCompletionRequest):
             search_enabled=search_enabled,
             ref_file_ids=ref_file_ids,
             tools=req.tools,
+            parent_message_id=parent_message_id,
+            headers=headers,
         )
-    except HTTPException:
+    except HTTPStatusError as exc:
+        raise _account_failure(agent, account, exc) from exc
+    except HTTPException as exc:
+        if exc.status_code == 502:
+            # Empty stream or unparsable tool envelope: the upstream chat may
+            # now contain a stray turn, so start clean next time.
+            agent.reset_remote()
         raise
     except Exception as exc:  # noqa: BLE001
         print("CHAT ERROR:", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    accounts.note_used(account)
+    agent.mark_sent(
+        sent_messages=delta_messages,
+        tools=req.tools,
+        prompt_chars=len(prompt),
+        output_chars=len(raw_text or ""),
+        message_id=message_id,
+    )
 
     completion_tokens = _estimate_tokens(raw_text)
 
@@ -487,12 +851,7 @@ def create_chat_completion(req: ChatCompletionRequest):
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content or None,
-                        "reasoning_content": thinking or None,
-                        "tool_calls": tool_calls,
-                    },
+                    "message": _assistant_message(content, thinking, tool_calls),
                     "finish_reason": "tool_calls",
                 }
             ],

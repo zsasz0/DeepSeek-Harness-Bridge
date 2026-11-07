@@ -38,6 +38,100 @@ def _dedupe_cookies(pairs: list[str]) -> str:
     return "; ".join(out)
 
 
+def build_headers(
+    token: Optional[str] = None, cookie_string: Optional[str] = None
+) -> Dict[str, str]:
+    """Browser-like headers required by DeepSeek's web API."""
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "DNT": "1",
+        "Origin": DEEPSEEK_BASE,
+        "Referer": f"{DEEPSEEK_BASE}/",
+        "Sec-Ch-Ua": '"Chromium";v="149", "Not)A;Brand";v="24", "Google Chrome";v="149"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+        ),
+        "x-app-version": "2.0.0",
+        "x-client-locale": "en_US",
+        "x-client-platform": "web",
+        "x-client-timezone-offset": "0",
+        "x-client-version": "2.0.0",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if cookie_string:
+        headers["Cookie"] = cookie_string
+    return headers
+
+
+def parse_credentials(raw_text: str) -> Tuple[Optional[str], str]:
+    """Extract (userToken, cookie_header) from arbitrary pasted text."""
+    raw = (raw_text or "").strip()
+    if not raw:
+        return None, ""
+
+    token: Optional[str] = None
+    cookie_parts: list[str] = []
+
+    # 1. JSON blob (e.g. localStorage copy)
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                token = (
+                    data.get("value")
+                    or data.get("token")
+                    or data.get("userToken")
+                    or data.get("data", {}).get("token")
+                )
+        except Exception:
+            pass
+
+    # 2. Bare JWT anywhere in the input
+    if not token:
+        match = _JWT_RE.search(raw)
+        if match:
+            token = match.group(0)
+
+    lines = raw.splitlines()
+    is_netscape = any(
+        "\t" in line for line in lines if line and not line.startswith("#")
+    )
+
+    if is_netscape:
+        # 3. Netscape cookies.txt format: domain, flag, path, secure,
+        #    expiry, name, value (tab separated).
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split("\t")
+            if len(parts) >= 7:
+                name, value = parts[5].strip(), parts[6].strip()
+                cookie_parts.append(f"{name}={value}")
+                if name == "userToken" and not token:
+                    token = value
+    else:
+        # 4. Raw Cookie header / cURL dump
+        cookie_text = _COOKIE_PREFIX_RE.sub("", raw)
+        for name, value in _COOKIE_PAIR_RE.findall(cookie_text):
+            if name.lower() in _NON_COOKIE_NAMES:
+                continue
+            cookie_parts.append(f"{name}={value}")
+            if name == "userToken" and not token:
+                token = value
+
+    return token, _dedupe_cookies(cookie_parts)
+
+
 class AuthManager:
     """Loads, validates and persists DeepSeek web credentials."""
 
@@ -57,62 +151,7 @@ class AuthManager:
     # ------------------------------------------------------------------
     def parse_credentials(self, raw_text: str) -> Tuple[Optional[str], str]:
         """Extract (userToken, cookie_header) from arbitrary pasted text."""
-        raw = (raw_text or "").strip()
-        if not raw:
-            return None, ""
-
-        token: Optional[str] = None
-        cookie_parts: list[str] = []
-
-        # 1. JSON blob (e.g. localStorage copy)
-        if raw.startswith("{") and raw.endswith("}"):
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    token = (
-                        data.get("value")
-                        or data.get("token")
-                        or data.get("userToken")
-                        or data.get("data", {}).get("token")
-                    )
-            except Exception:
-                pass
-
-        # 2. Bare JWT anywhere in the input
-        if not token:
-            match = _JWT_RE.search(raw)
-            if match:
-                token = match.group(0)
-
-        lines = raw.splitlines()
-        is_netscape = any(
-            "\t" in line for line in lines if line and not line.startswith("#")
-        )
-
-        if is_netscape:
-            # 3. Netscape cookies.txt format: domain, flag, path, secure,
-            #    expiry, name, value (tab separated).
-            for line in lines:
-                stripped = line.strip()
-                if not stripped or stripped.startswith("#"):
-                    continue
-                parts = stripped.split("\t")
-                if len(parts) >= 7:
-                    name, value = parts[5].strip(), parts[6].strip()
-                    cookie_parts.append(f"{name}={value}")
-                    if name == "userToken" and not token:
-                        token = value
-        else:
-            # 4. Raw Cookie header / cURL dump
-            cookie_text = _COOKIE_PREFIX_RE.sub("", raw)
-            for name, value in _COOKIE_PAIR_RE.findall(cookie_text):
-                if name.lower() in _NON_COOKIE_NAMES:
-                    continue
-                cookie_parts.append(f"{name}={value}")
-                if name == "userToken" and not token:
-                    token = value
-
-        return token, _dedupe_cookies(cookie_parts)
+        return parse_credentials(raw_text)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -207,33 +246,9 @@ class AuthManager:
         self, token: Optional[str] = None, cookie_string: Optional[str] = None
     ) -> Dict[str, str]:
         """Browser-like headers required by DeepSeek's web API."""
-        tok = token or self.token
-        ck = cookie_string if cookie_string is not None else self.cookie_string
-
-        headers = {
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/json",
-            "DNT": "1",
-            "Origin": DEEPSEEK_BASE,
-            "Referer": f"{DEEPSEEK_BASE}/",
-            "Sec-Ch-Ua": '"Not A(Brand";v="8", "Chromium";v="132", "Google Chrome";v="132"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+        return build_headers(
+            token=token or self.token,
+            cookie_string=(
+                cookie_string if cookie_string is not None else self.cookie_string
             ),
-            "x-app-version": "20241129.1",
-            "x-client-locale": "en_US",
-            "x-client-platform": "web",
-            "x-client-version": "1.0.0-always",
-        }
-        if tok:
-            headers["Authorization"] = f"Bearer {tok}"
-        if ck:
-            headers["Cookie"] = ck
-        return headers
+        )

@@ -21,8 +21,17 @@ using your own logged-in session. Works with any OpenAI-compatible client
   web-search variants.
 - 🔐 **Built-in PoW solver** — solves DeepSeek's `DeepSeekHashV1` WebAssembly
   proof-of-work challenge automatically.
-- 🔄 **True SSE streaming** — streams content and `reasoning_content` as it is
-  generated.
+- 🔄 **True SSE streaming** — without `tools` the upstream reply is forwarded
+  live, including `reasoning_content`. With `tools` the reply is buffered so
+  tool-call deltas can be parsed before emission.
+- 🧵 **Session reuse** — one live DeepSeek chat per agent, keyed by the
+  `x-agent-session` (or `session` / `user`) header. Follow-up turns send only
+  the new messages and reuse the upstream `parent_message_id`.
+- 👥 **Multi-account pool** — drop several credential files in a folder and the
+  server rotates between them, keeps each agent sticky to one account, honours
+  `Retry-After` and cools down rate-limited or expired accounts.
+- 🛡️ **Safe by default** — loopback-only bind, restricted CORS, no remote image
+  fetching (SSRF-safe), optional `PROXY_API_KEY` bearer gate.
 - 🛠️ **Tool calling** — the model is asked for a single JSON envelope; a
   waterfall parser (`raw_decode` → `json_repair` → `json5` → fences) recovers
   it, then retries once with self-correction and fails **loudly** with HTTP 502
@@ -304,11 +313,48 @@ litellm --config litellm_config.yaml --port 4000
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/` | Dashboard UI |
-| `GET` | `/health` | Liveness check |
+| `GET` | `/health` | Liveness + account summary |
+| `GET` | `/readyz` | Readiness (at least one account ready) |
 | `GET` | `/api/status` | Auth status and user info |
 | `POST` | `/api/cookies` | Save/validate credentials |
 | `GET` | `/v1/models` | List available models |
 | `POST` | `/v1/chat/completions` | Chat completion (stream or not) |
+| `GET` | `/v1/sessions` | Per-agent session state |
+| `POST` | `/reset-session?agent=<id>\|all` | Drop an agent's upstream chat |
+| `GET` | `/v1/accounts` | Account pool state |
+| `POST` | `/reload-accounts` | Re-read credential files |
+
+---
+
+## Sessions
+
+Send any of these headers to pin a conversation to one agent:
+
+```
+x-agent-session: my-agent
+session: my-agent
+user: my-agent
+```
+
+Without a header the id is `default`.
+
+The first request creates a DeepSeek chat and records which client messages
+the remote chat has seen. Later requests send only `messages[N:]` and pass the
+previous assistant `message_id` as `parent_message_id`, so the web model keeps
+its own context instead of receiving the whole transcript again.
+
+A session resets automatically when:
+
+| Reason | Trigger |
+|---|---|
+| `session_ttl` | older than `DEEPSEEK_SESSION_TTL_MS` (default 2h) |
+| `max_message_depth` | more than `DEEPSEEK_MAX_MESSAGE_DEPTH` turns (100) |
+| `max_context_chars` | accumulated prompt+output chars over the limit |
+| `tools_changed` | the request's `tools` array changed |
+| `history_mismatch` | the client rewrote/compacted earlier messages |
+
+When a reset happens, the **full conversation is resent** to the new chat, so
+context is never lost — only reused when safe.
 
 ---
 
@@ -327,7 +373,50 @@ Credentials are read from `config.json` in the project root:
 `config.json` and `cookie_deepseek.txt` are **git-ignored**. A safe template
 lives in `config.example.json`.
 
-To change the host/port, edit `main.py` (defaults: `127.0.0.1:8084`).
+### Multi-account
+
+Point `DEEPSEEK_AUTH_DIR` at a folder of credential files (any mix of JSON,
+cookie strings or Netscape `cookies.txt`), or list explicit paths:
+
+```bash
+DEEPSEEK_AUTH_DIR=C:\deepseek-accounts
+# or
+DEEPSEEK_AUTH_PATH=C:\a.json,C:\b.txt
+```
+
+Behaviour: an agent stays on its account while it is healthy; when an account
+returns 401/403 it cools down for 30 min, and 429 / `Too many messages` uses
+`Retry-After` (default 60 s). If every account is cooling, the request gets
+HTTP 429 with a `Retry-After` header.
+
+### Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PROXY_HOST` / `PROXY_PORT` | `127.0.0.1` / `8084` | Bind address |
+| `PROXY_API_KEY` | unset | Require `Authorization: Bearer <key>` on all routes except `/health`/`/readyz` |
+| `PROXY_CORS_ORIGINS` | unset | Extra comma-separated allowed origins |
+| `DEEPSEEK_AUTH_DIR` / `DEEPSEEK_AUTH_PATH` | unset | Account pool sources |
+| `DEEPSEEK_SESSION_TTL_MS` | `7200000` | Session lifetime |
+| `DEEPSEEK_MAX_MESSAGE_DEPTH` | `100` | Turns before reset |
+| `DEEPSEEK_MAX_PROMPT_CHARS` | `80000` | Prompt size limit |
+| `DEEPSEEK_MAX_SESSION_CHARS` | `240000` | Accumulated session chars |
+
+> The dashboard and `/api/cookies` are protected by `PROXY_API_KEY` when it is
+> set. Use `curl -H "Authorization: Bearer $PROXY_API_KEY" ...` or an API
+> client that sends the header.
+
+---
+
+## Security
+
+- Binds to `127.0.0.1` by default; set `PROXY_HOST=0.0.0.0` only behind a
+  reverse proxy, and set `PROXY_API_KEY` if you do.
+- CORS allows only loopback origins plus `PROXY_CORS_ORIGINS`; credentials are
+  never sent cross-origin by the proxy.
+- Image input accepts **inline `data:` URIs only**. Remote URLs are never
+  fetched, so this proxy cannot be used as an SSRF gadget against internal
+  networks or cloud metadata endpoints.
 
 ---
 

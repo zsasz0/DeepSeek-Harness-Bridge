@@ -19,6 +19,49 @@ COMPLETION_URL = f"{DEEPSEEK_BASE}/api/v0/chat/completion"
 UPLOAD_FILE_URL = f"{DEEPSEEK_BASE}/api/v0/file/upload_file"
 
 
+class HTTPStatusError(RuntimeError):
+    """Upstream returned a non-2xx status, carrying what the pool needs."""
+
+    def __init__(self, message: str, status_code: int, retry_after=None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _is_auth_error(code, message) -> bool:
+    """DeepSeek reports auth failures with HTTP 200 + a business code."""
+    text = str(message or "").lower()
+    if code in (40001, 40002, 40003):
+        return True
+    return "invalid token" in text or "authorization failed" in text
+
+
+def _retry_after_seconds(resp) -> Optional[float]:
+    """Parse a Retry-After header (seconds or HTTP date) if present."""
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    raw = None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(raw)
+        return max(0.0, when.timestamp() - time.time())
+    except Exception:
+        return None
+
+
 class DeepSeekWebClient:
     """Minimal client for DeepSeek's web chat endpoints."""
 
@@ -29,26 +72,39 @@ class DeepSeekWebClient:
     def _new_session(self) -> requests.Session:
         return requests.Session(impersonate="chrome124")
 
-    def create_chat_session(self, session=None) -> str:
+    def _resolve_headers(self, headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+        """Use per-account headers when provided, else the manager's."""
+        return dict(headers) if headers else self.auth.get_headers()
+
+    def create_chat_session(
+        self, session=None, headers: Optional[Dict[str, str]] = None
+    ) -> str:
         sess = session or self._new_session()
-        headers = self.auth.get_headers()
+        req_headers = self._resolve_headers(headers)
 
         resp = sess.post(
             SESSION_CREATE_URL,
-            headers=headers,
+            headers=req_headers,
             json={"character_id": None},
             timeout=15,
         )
         if resp.status_code != 200:
-            raise RuntimeError(
-                f"Failed to create chat session: HTTP {resp.status_code} - {resp.text[:150]}"
+            raise HTTPStatusError(
+                f"Failed to create chat session: HTTP {resp.status_code} - {resp.text[:150]}",
+                status_code=resp.status_code,
+                retry_after=_retry_after_seconds(resp),
             )
-
         data = resp.json()
         if data.get("code") != 0:
+            code = data.get("code")
+            message = data.get("msg", "Unknown error")
+            if _is_auth_error(code, message):
+                raise HTTPStatusError(
+                    f"DeepSeek auth error: {message} (code: {code})", 401
+                )
             raise RuntimeError(
-                f"DeepSeek chat_session/create error: {data.get('msg', 'Unknown error')} "
-                f"(code: {data.get('code')})"
+                f"DeepSeek chat_session/create error: {message} "
+                f"(code: {code})"
             )
 
         biz_data = data.get("data", {}).get("biz_data", {})
@@ -57,15 +113,22 @@ class DeepSeekWebClient:
             raise RuntimeError("Failed to obtain chat_session_id from DeepSeek response")
         return session_id
 
-    def upload_file(self, data, filename, mime_type, session=None):
+    def upload_file(
+        self,
+        data,
+        filename,
+        mime_type,
+        session=None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
         sess = session or self._new_session()
-        headers = self.auth.get_headers()
-        headers.pop("Content-Type", None)
+        req_headers = self._resolve_headers(headers)
+        req_headers.pop("Content-Type", None)
 
         pow_header = self.pow_solver.fetch_and_solve(
-            sess, headers, target_path="/api/v0/file/upload_file"
+            sess, req_headers, target_path="/api/v0/file/upload_file"
         )
-        headers["x-ds-pow-response"] = pow_header
+        req_headers["x-ds-pow-response"] = pow_header
 
         mp = CurlMime()
         mp.addpart(
@@ -76,7 +139,7 @@ class DeepSeekWebClient:
         )
         resp = sess.post(
             UPLOAD_FILE_URL,
-            headers=headers,
+            headers=req_headers,
             multipart=mp,
             timeout=60,
         )
@@ -98,8 +161,6 @@ class DeepSeekWebClient:
         if not file_id:
             raise RuntimeError("Upload response did not contain a file id")
 
-        print(f"[upload] {file_id} status={status}")
-
         for attempt in range(15):
             if status == "SUCCESS":
                 break
@@ -107,28 +168,24 @@ class DeepSeekWebClient:
             try:
                 poll_resp = sess.get(
                     f"{DEEPSEEK_BASE}/api/v0/file/fetch_files",
-                    headers=self.auth.get_headers(),
+                    headers=self._resolve_headers(headers),
                     params={"file_ids": file_id},
                     timeout=10,
                 )
-                print(f"[upload] poll #{attempt+1} HTTP {poll_resp.status_code}")
                 if poll_resp.status_code == 200:
-                    data = poll_resp.json()
-                    biz = (data.get("data") or {}).get("biz_data") or {}
+                    poll_data = poll_resp.json()
+                    biz = (poll_data.get("data") or {}).get("biz_data") or {}
                     files = biz.get("files") if isinstance(biz, dict) else biz
                     if isinstance(files, list):
                         for f in files:
                             if isinstance(f, dict) and f.get("id") == file_id:
                                 status = f.get("status")
-                                print(f"[upload] poll #{attempt+1} status={status}")
                                 break
-                else:
-                    print(f"[upload] poll body: {poll_resp.text[:200]}")
-            except Exception as e:
-                print(f"[upload] poll error: {e}")
+            except Exception:
+                # Polling is best-effort; the post-upload wait covers slow jobs.
+                pass
 
         if status != "SUCCESS":
-            print(f"[upload] WARN {file_id} still {status}")
             time.sleep(3)
         else:
             time.sleep(1.5)  # wait for vision pipeline to index the file
@@ -144,41 +201,49 @@ class DeepSeekWebClient:
         parent_message_id=None,
         ref_file_ids=None,
         session=None,
+        headers: Optional[Dict[str, str]] = None,
     ):
         sess = session or self._new_session()
-        headers = self.auth.get_headers()
+        req_headers = self._resolve_headers(headers)
 
         if not session_id:
-            session_id = self.create_chat_session(sess)
+            session_id = self.create_chat_session(sess, headers=req_headers)
 
         pow_header = self.pow_solver.fetch_and_solve(
-            sess, headers, target_path="/api/v0/chat/completion"
+            sess, req_headers, target_path="/api/v0/chat/completion"
         )
-        headers["x-ds-pow-response"] = pow_header
+        req_headers["x-ds-pow-response"] = pow_header
 
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": parent_message_id,
+            "model_type": "default",
             "prompt": prompt,
             "ref_file_ids": ref_file_ids or [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "action": None,
+            "preempt": False,
         }
-        print("[chat] payload ref_file_ids=", payload["ref_file_ids"])
-
         resp = sess.post(
             COMPLETION_URL,
-            headers=headers,
+            headers=req_headers,
             json=payload,
             stream=True,
             timeout=180,
         )
         if resp.status_code != 200:
             body = resp.text[:300] if hasattr(resp, "text") else ""
+            yield {
+                "type": "http_error",
+                "status": resp.status_code,
+                "retry_after": _retry_after_seconds(resp),
+            }
             yield {"type": "error", "message": f"HTTP {resp.status_code} - {body}"}
             return
 
         current_frag_type = "RESPONSE"
+        message_id: Optional[str] = None
 
         for raw_line in resp.iter_lines():
             if not raw_line:
@@ -186,10 +251,11 @@ class DeepSeekWebClient:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
-            print("RAW:", line)
 
             if line.startswith("event:"):
                 if line[6:].strip() == "close":
+                    if message_id:
+                        yield {"type": "message_id", "id": message_id}
                     yield {"type": "done", "finish_reason": "stop"}
                     return
                 continue
@@ -199,6 +265,8 @@ class DeepSeekWebClient:
 
             line_content = line[5:].strip()
             if not line_content or line_content == "[DONE]":
+                if message_id:
+                    yield {"type": "message_id", "id": message_id}
                 yield {"type": "done", "finish_reason": "stop"}
                 return
 
@@ -207,12 +275,30 @@ class DeepSeekWebClient:
             except json.JSONDecodeError:
                 continue
 
+            # Capture the assistant message id so the next turn can pass it
+            # back as parent_message_id and continue the same chat chain.
+            if isinstance(data, dict):
+                rid = data.get("response_message_id")
+                if rid and not message_id:
+                    message_id = str(rid)
+                inner_v = data.get("v")
+                if isinstance(inner_v, dict):
+                    resp_obj = inner_v.get("response")
+                    if isinstance(resp_obj, dict):
+                        inner_mid = resp_obj.get("message_id")
+                        if inner_mid:
+                            message_id = str(inner_mid)
+
             if isinstance(data, dict):
                 if data.get("code", 0) != 0:
+                    code = data.get("code")
+                    message = data.get("msg", "Error")
+                    if _is_auth_error(code, message):
+                        yield {"type": "http_error", "status": 401, "retry_after": None}
                     yield {
                         "type": "error",
-                        "message": f"DeepSeek stream error: {data.get('msg', 'Error')} "
-                        f"(code: {data.get('code')})",
+                        "message": f"DeepSeek stream error: {message} "
+                        f"(code: {code})",
                     }
                     return
                 inner_data = data.get("data")
@@ -229,6 +315,8 @@ class DeepSeekWebClient:
                 and data.get("p") == "response/status"
                 and data.get("v") == "FINISHED"
             ):
+                if message_id:
+                    yield {"type": "message_id", "id": message_id}
                 yield {"type": "done", "finish_reason": "stop"}
                 return
 
@@ -316,4 +404,6 @@ class DeepSeekWebClient:
                 }
                 continue
 
+        if message_id:
+            yield {"type": "message_id", "id": message_id}
         yield {"type": "done", "finish_reason": "stop"}

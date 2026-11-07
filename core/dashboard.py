@@ -104,10 +104,31 @@ document.getElementById("snippet").textContent = JSON.stringify(CONFIG, null, 2)
 
 function copySnippet(){ navigator.clipboard.writeText(JSON.stringify(CONFIG,null,2)); }
 
+function proxyKey(){
+  const fromUrl = new URLSearchParams(location.search).get("key");
+  if (fromUrl) localStorage.setItem("proxyKey", fromUrl);
+  return localStorage.getItem("proxyKey") || "";
+}
+async function apiFetch(url, options){
+  options = options || {};
+  const headers = Object.assign({}, options.headers || {});
+  const key = proxyKey();
+  if (key) headers["Authorization"] = "Bearer " + key;
+  const r = await fetch(url, Object.assign({}, options, {headers}));
+  if (r.status === 401 && !key){
+    const entered = prompt("This proxy requires PROXY_API_KEY. Enter it:");
+    if (entered){
+      localStorage.setItem("proxyKey", entered.trim());
+      return apiFetch(url, options);
+    }
+  }
+  return r;
+}
+
 async function checkStatus(){
   const b = document.getElementById("badge");
   try {
-    const r = await fetch("/api/status");
+    const r = await apiFetch("/api/status");
     const d = await r.json();
     if (d.authenticated) {
       b.className = "badge ok";
@@ -125,7 +146,7 @@ async function checkStatus(){
 async function saveCreds(){
   const raw = document.getElementById("creds").value.trim();
   if (!raw) return alert("Paste credentials first.");
-  const r = await fetch("/api/cookies", {
+  const r = await apiFetch("/api/cookies", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({raw_text: raw})
@@ -138,7 +159,7 @@ async function saveCreds(){
 
 async function clearCreds(){
   if (!confirm("Clear stored credentials?")) return;
-  await fetch("/api/cookies", {
+  await apiFetch("/api/cookies", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({raw_text: ""})
@@ -167,7 +188,7 @@ async function send(){
   document.getElementById("sendBtn").disabled = true;
 
   try {
-    const r = await fetch("/v1/chat/completions", {
+    const r = await apiFetch("/v1/chat/completions", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({model, messages:[{role:"user",content:text}], stream:true})

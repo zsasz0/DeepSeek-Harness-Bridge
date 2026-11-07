@@ -54,6 +54,10 @@ def _sse_json(chunks):
                 out.append((None, "DONE"))
                 continue
             obj = json.loads(payload)
+            if obj.get("error"):
+                # Top-level SSE error event (headers already sent).
+                out.append(({"__error__": obj["error"]}, "error"))
+                continue
             choices = obj.get("choices") or []
             if not choices:
                 # usage-only chunk (stream_options.include_usage)
@@ -84,7 +88,7 @@ class FakeClient:
     def _new_session(self):
         return None
 
-    def create_chat_session(self, session=None):
+    def create_chat_session(self, session=None, headers=None):
         return "fake-session"
 
     def stream_chat(self, prompt, **kwargs):
@@ -107,7 +111,7 @@ def _patch_client(fake):
 
 
 class StreamTests(unittest.TestCase):
-    def _run(self, replies, **request_overrides):
+    def _run(self, replies, tools=TOOLS, **request_overrides):
         fake = FakeClient(replies)
         patches = _patch_client(fake)
         for p in patches:
@@ -117,13 +121,11 @@ class StreamTests(unittest.TestCase):
         req = ChatCompletionRequest(
             model="deepseek-chat",
             messages=[{"role": "user", "content": "list files"}],
-            tools=TOOLS,
+            tools=tools,
             stream=True,
         )
         for key, value in request_overrides.items():
             setattr(req, key, value)
-        # The handler runs generation + parsing before the response starts, so a
-        # hard failure surfaces as a synchronous HTTPException.
         response = create_chat_completion(req)
         return _sse_json(_collect(response)), fake
 
@@ -173,23 +175,28 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(deltas[0]["tool_calls"][0]["function"]["name"], "bash")
 
     def test_talk_only_stream(self):
-        events, fake = self._run([TALK])
+        events, fake = self._run([TALK], tools=None)
         self.assertEqual(len(fake.prompts), 1, "valid talk-only reply must not retry")
         deltas = [d for d, _ in events if d is not None]
         self.assertEqual(deltas[0]["role"], "assistant")
-        self.assertEqual(deltas[0]["content"], "4")
+        self.assertEqual(deltas[0]["content"], TALK)
         self.assertEqual(events[-2], ({}, "stop"))
         self.assertEqual(events[-1], (None, "DONE"))
 
     def test_empty_reply_fails_loudly(self):
-        # An empty assistant message is useless; 502 lets the client back off.
-        with self.assertRaises(HTTPException) as ctx:
-            self._run([""])
-        self.assertEqual(ctx.exception.status_code, 502)
-        self.assertIn("empty response", ctx.exception.detail)
+        # No-tools path streams live, so an empty upstream reply is reported
+        # inside the stream as an error event rather than as HTTP 502.
+        events, _ = self._run([""], tools=None)
+        self.assertTrue(
+            any(delta and "__error__" in delta for delta, _ in events),
+            "empty live reply must surface an error event",
+        )
+        self.assertEqual(events[-1], (None, "DONE"))
 
     def test_usage_chunk_when_requested(self):
-        events, _ = self._run([TALK], stream_options={"include_usage": True})
+        events, _ = self._run(
+            [TALK], tools=None, stream_options={"include_usage": True}
+        )
         usage = [d for d, kind in events if kind == "usage"]
         self.assertEqual(len(usage), 1)
         self.assertGreater(usage[0]["__usage__"]["total_tokens"], 0)
