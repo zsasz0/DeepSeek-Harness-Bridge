@@ -9,6 +9,8 @@ using your own logged-in session. Works with any OpenAI-compatible client
 
 ![DeepSeek Web2API dashboard](docs/dashboard.png)
 
+![OpenCode using DeepSeek Web2API](docs/opencode-preview.png)
+
 > ⚠️ **Disclaimer** — This project is unofficial and not affiliated with
 > DeepSeek. It relies on private web endpoints and may break at any time.
 > Use it for personal experimentation only and respect DeepSeek's Terms of
@@ -236,11 +238,9 @@ for chunk in stream:
 
 ---
 
-## Client integration
+## Integration and usage in OpenCode
 
 ### OpenCode
-
-![OpenCode using DeepSeek Web2API](docs/opencode-preview.png)
 
 Add this provider to your OpenCode config
 (`~/.config/opencode/opencode.json` on Linux/macOS,
