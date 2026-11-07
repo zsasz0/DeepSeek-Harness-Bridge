@@ -101,8 +101,9 @@ and never committed.
 4. On the left, expand **Local Storage** → click `https://chat.deepseek.com`.
 5. Find the key **`userToken`**, double-click its value and copy it
    (it starts with `eyJ...`).
-6. Paste it into the dashboard at `http://localhost:8084` and click
-   **Save & Connect**.
+6. Paste it into `accounts/acct1.txt` (replacing the
+   `PUT_YOUR_DEEPSEEK_USERTOKEN_HERE` placeholder), save the file, then launch
+   the app (`start.bat` on Windows or `./start.sh` on Linux/macOS).
 
 ### Method 2 — Export cookies
 
