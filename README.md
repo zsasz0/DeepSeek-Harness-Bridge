@@ -42,8 +42,8 @@ using your own logged-in session. Works with any OpenAI-compatible client
   instead of leaking broken markup into `content`.
 - 🖼️ **Image input** — uploads images from `image_url` parts to DeepSeek's
   vision pipeline.
-- 🎛️ **Web dashboard** — paste credentials, check status and test chat at
-  `http://localhost:8084`.
+- 🎛️ **Web dashboard** — add tokens with one click (auto-saved as
+  `accounts/acctN.txt`), check status and test chat at `http://localhost:8084`.
 - 🐧 **Windows + Linux/macOS** — ships with both `.bat` and `.sh` launchers.
 
 ---
@@ -90,8 +90,10 @@ automatically (harmless on headless servers).
 ## Getting your DeepSeek credentials
 
 You only need the **`userToken`** (a JWT starting with `eyJ...`), or the full
-cookie string. Both are stored locally in `config.json`, which is git-ignored
-and never committed.
+cookie string. The easiest path is to paste it into the dashboard's **Add
+Account** box: it is validated, then saved automatically as
+`accounts/acctN.txt` (git-ignored). The legacy `config.json` single-account
+mode still works if no account files are present.
 
 ### Method 1 — Browser DevTools (fastest)
 
@@ -101,9 +103,10 @@ and never committed.
 4. On the left, expand **Local Storage** → click `https://chat.deepseek.com`.
 5. Find the key **`userToken`**, double-click its value and copy it
    (it starts with `eyJ...`).
-6. Paste it into `accounts/acct1.txt` (replacing the
-   `PUT_YOUR_DEEPSEEK_USERTOKEN_HERE` placeholder), save the file, then launch
-   the app (`start.bat` on Windows or `./start.sh` on Linux/macOS).
+6. Launch the app (`start.bat` on Windows or `./start.sh` on Linux/macOS),
+   open `http://localhost:8084`, paste the value into **Add Account** and press
+   **Add Account**. The proxy validates it and writes `accounts/acct3.txt`,
+   `acct4.txt`, … as you add more tokens.
 
 ### Method 2 — Export cookies
 
@@ -113,8 +116,9 @@ and never committed.
 2. Visit [chat.deepseek.com](https://chat.deepseek.com) while logged in.
 3. Export the cookies for the site.
 4. Either save them as `cookie_deepseek.txt` in the project folder, or paste
-   the content into the dashboard. Both raw cookie strings and Netscape
-   `cookies.txt` format are accepted.
+   the content into the dashboard's **Add Account** box (saved as
+   `accounts/acctN.txt`). Both raw cookie strings and Netscape `cookies.txt`
+   format are accepted.
 
 ### Method 3 — Paste anything that contains the token
 
@@ -321,7 +325,9 @@ litellm --config litellm_config.yaml --port 4000
 | `GET` | `/health` | Liveness + account summary |
 | `GET` | `/readyz` | Readiness (at least one account ready) |
 | `GET` | `/api/status` | Auth status and user info |
-| `POST` | `/api/cookies` | Save/validate credentials |
+| `POST` | `/api/accounts` | Validate a token and save it as `accounts/acctN.txt` |
+| `DELETE` | `/api/accounts/{file}` | Delete one `acctN.txt` credential file |
+| `POST` | `/api/cookies` | Legacy single-account save (writes `config.json`) |
 | `GET` | `/v1/models` | List available models |
 | `POST` | `/v1/chat/completions` | Chat completion (stream or not) |
 | `GET` | `/v1/sessions` | Per-agent session state |
@@ -365,7 +371,9 @@ context is never lost — only reused when safe.
 
 ## Configuration
 
-Credentials are read from `config.json` in the project root:
+The file-based account pool (`accounts/`, described below) is the default.
+When it has no usable credential files, the proxy falls back to a single
+account read from `config.json` in the project root:
 
 ```json
 {
@@ -383,33 +391,42 @@ values, or just use the dashboard.
 
 #### In-project `accounts/` folder (default)
 
-The repo ships with an `accounts/` folder next to `main.py`. **This is where you
-put your token.** `main.py` points the pool at this folder automatically when it
-exists, so no environment variable is needed:
+The repo ships with an `accounts/` folder next to `main.py`. `main.py` points
+the pool at this folder automatically when it exists, so no environment variable
+is needed:
 
 ```text
 deepseek-webApi2-v1-json/
 ├── accounts/
-│   ├── acct1.txt      ← put your token in this file
-│   ├── acct2.txt      ← optional second account
+│   ├── acct1.txt      ← tracked placeholder (do not commit a real token)
+│   ├── acct2.txt      ← created by the dashboard
+│   ├── acct3.txt      ← next token you add
 │   └── ...
 ├── core/
 ├── main.py
 └── ...
 ```
 
-**How to add your account:**
+**How to add your account (recommended):**
 
-1. Open `accounts/acct1.txt`. It currently contains the placeholder line
-   `PUT_YOUR_DEEPSEEK_USERTOKEN_HERE`.
-2. Replace that placeholder with your real `userToken` (a JWT starting with
-   `eyJ...`) — see [Getting your DeepSeek credentials](#getting-your-deepseek-credentials).
-   You can also paste a `Cookie:` header, a Netscape `cookies.txt`, or a JSON
-   blob instead; `parse_credentials` extracts the token automatically.
-3. Save the file. Restart the server, or call `POST /reload-accounts` to pick
-   it up without a restart.
-4. For more accounts, copy `acct1.txt` to `acct2.txt`, `acct3.txt`, … and put a
-   different token in each. The pool rotates between them.
+1. Start the server and open `http://localhost:8084`.
+2. Paste your `userToken` (a JWT starting with `eyJ...`) — or a `Cookie:`
+   header, Netscape `cookies.txt`, cURL dump or JSON blob — into **Add Account**
+   and press **Add Account**. See
+   [Getting your DeepSeek credentials](#getting-your-deepseek-credentials).
+3. The proxy checks the token against DeepSeek first. Only valid credentials are
+   written, as the next free `acctN.txt` (so `acct1.txt` + `acct2.txt` → you get
+   `acct3.txt`). Invalid tokens are rejected and nothing is saved.
+4. Add more tokens the same way; the pool rotates between them. Use the `×`
+   button on an account row to delete its file.
+
+**Manual alternative:**
+
+1. Open `accounts/acct1.txt` and replace the
+   `PUT_YOUR_DEEPSEEK_USERTOKEN_HERE` placeholder with a real token, or copy it
+   to `acct2.txt`, `acct3.txt`, … with one token per file.
+2. Restart the server, or call `POST /reload-accounts` to pick it up without a
+   restart. `parse_credentials` extracts the token from any supported format.
 
 **What is tracked vs. secret:**
 
@@ -463,9 +480,9 @@ or in the dashboard.
 | `DEEPSEEK_MAX_PROMPT_CHARS` | `80000` | Prompt size limit |
 | `DEEPSEEK_MAX_SESSION_CHARS` | `240000` | Accumulated session chars |
 
-> The dashboard and `/api/cookies` are protected by `PROXY_API_KEY` when it is
-> set. Use `curl -H "Authorization: Bearer $PROXY_API_KEY" ...` or an API
-> client that sends the header.
+> The dashboard and the `/api/*` account endpoints are protected by
+> `PROXY_API_KEY` when it is set. Use `curl -H "Authorization: Bearer $PROXY_API_KEY" ...`
+> or an API client that sends the header.
 
 ---
 

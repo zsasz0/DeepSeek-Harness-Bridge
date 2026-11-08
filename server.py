@@ -20,8 +20,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
-from core.accounts import build_pool
-from core.auth import AuthManager
+from core.accounts import (
+    build_pool,
+    delete_credential_file,
+    probe_credentials,
+    save_credential_file,
+)
+from core.auth import AuthManager, parse_credentials
 from core.client import DeepSeekWebClient, HTTPStatusError, StreamStalled
 from core.dashboard import DASHBOARD_HTML
 from core.openai_adapter import (
@@ -155,6 +160,10 @@ class CookieUpdateRequest(BaseModel):
     raw_text: str
 
 
+class AccountCreateRequest(BaseModel):
+    raw_text: str
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "deepseek-chat"
     messages: List[Dict[str, Any]]
@@ -195,10 +204,81 @@ async def ready_check() -> Dict[str, Any]:
 
 @app.get("/api/status")
 async def get_status() -> Dict[str, Any]:
-    if not auth_manager.token:
+    if auth_manager.token:
+        is_valid, user_info, message = auth_manager.validate_session()
+        return {"authenticated": is_valid, "user": user_info, "message": message}
+
+    pool = accounts.status()
+    if not pool:
         return {"authenticated": False, "message": "No token provided"}
-    is_valid, user_info, message = auth_manager.validate_session()
-    return {"authenticated": is_valid, "user": user_info, "message": message}
+
+    valid = next((account for account in pool if account["valid"] is True), None)
+    if valid:
+        return {
+            "authenticated": True,
+            "user": {"nickname": valid["valid_message"]},
+            "message": f"{len(pool)} account(s) loaded",
+        }
+    return {
+        "authenticated": False,
+        "message": "No valid accounts; check the Accounts panel.",
+    }
+
+
+@app.post("/api/accounts")
+def add_account(req: AccountCreateRequest) -> Dict[str, Any]:
+    """Validate pasted credentials and save them as accounts/acctN.txt."""
+    raw = req.raw_text.strip()
+    if not raw:
+        return {"success": False, "message": "Paste a token or cookies first."}
+
+    token, cookie = parse_credentials(raw)
+    if not token and not cookie:
+        return {"success": False, "message": "Could not extract credentials."}
+
+    is_valid, detail = probe_credentials(token, cookie)
+    if not is_valid:
+        return {"success": False, "message": f"Validation failed: {detail}"}
+
+    try:
+        path = save_credential_file(raw)
+    except (OSError, ValueError) as exc:
+        return {"success": False, "message": f"Could not save account: {exc}"}
+
+    accounts.reload()
+    filename = os.path.basename(path)
+    accounts.mark_valid(filename, is_valid, detail)
+    entry = next(
+        (account for account in accounts.status() if account["source"] == filename),
+        None,
+    )
+    return {
+        "success": True,
+        "message": f"Added {filename} ({detail}).",
+        "file": filename,
+        "account": entry,
+    }
+
+
+@app.delete("/api/accounts/{filename}")
+def remove_account(filename: str) -> Dict[str, Any]:
+    """Delete one account file created through the dashboard."""
+    try:
+        removed = delete_credential_file(filename)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    except OSError as exc:
+        return {"success": False, "message": f"Could not delete {filename}: {exc}"}
+
+    if not removed:
+        return {"success": False, "message": f"{filename} was already gone."}
+
+    accounts.reload()
+    return {
+        "success": True,
+        "message": f"Deleted {filename}.",
+        "data": accounts.status(),
+    }
 
 
 @app.post("/api/cookies")
@@ -243,7 +323,7 @@ async def list_accounts() -> Dict[str, Any]:
 
 
 @app.post("/v1/accounts")
-async def validate_accounts() -> Dict[str, Any]:
+def validate_accounts() -> Dict[str, Any]:
     """Check every account live. Used by the dashboard's Re-check button."""
     return {"object": "list", "data": accounts.validate_all(force=True)}
 

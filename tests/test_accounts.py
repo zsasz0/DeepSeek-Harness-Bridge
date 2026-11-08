@@ -14,6 +14,8 @@ from core.accounts import (
     Account,
     AccountPool,
     RATE_LIMIT_COOLDOWN,
+    delete_credential_file,
+    save_credential_file,
 )
 from core.auth import build_headers
 
@@ -94,6 +96,82 @@ class PoolTests(unittest.TestCase):
         pool = make_pool()
         self.assertIsNone(pool.select("agent"))
         self.assertEqual(pool.size(), 0)
+
+
+class AccountFileTests(unittest.TestCase):
+    def test_next_file_uses_highest_number_plus_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("acct1.txt", "acct2.txt"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write("x")
+            path = save_credential_file(JWT_A, directory=tmp)
+            self.assertEqual(os.path.basename(path), "acct3.txt")
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read().strip(), JWT_A)
+
+    def test_next_file_skips_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("acct1.txt", "acct7.txt"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write("x")
+            path = save_credential_file(JWT_B, directory=tmp)
+            self.assertEqual(os.path.basename(path), "acct8.txt")
+
+    def test_delete_removes_only_account_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = save_credential_file(JWT_A, directory=tmp)
+            name = os.path.basename(path)
+            self.assertTrue(delete_credential_file(name, directory=tmp))
+            self.assertFalse(delete_credential_file(name, directory=tmp))
+            for bad in ("../acct9.txt", "notes.txt", "acct9.json", ""):
+                with self.assertRaises(ValueError):
+                    delete_credential_file(bad, directory=tmp)
+
+    def test_save_rejects_empty_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                save_credential_file("   ", directory=tmp)
+
+
+class AddAccountEndpointTests(unittest.TestCase):
+    def _call(self, raw_text, tmp, probe):
+        request = server.AccountCreateRequest(raw_text=raw_text)
+        with patch.dict(
+            os.environ,
+            {"DEEPSEEK_AUTH_DIR": tmp, "DEEPSEEK_AUTH_PATH": ""},
+        ), patch.object(server, "probe_credentials", return_value=probe), patch(
+            "core.accounts.probe_credentials", return_value=probe
+        ):
+            return server.add_account(request)
+
+    def test_invalid_token_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._call(JWT_A, tmp, (False, "HTTP 401"))
+            self.assertFalse(result["success"])
+            self.assertIn("HTTP 401", result["message"])
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_valid_token_creates_next_file(self):
+        old_accounts = list(server.accounts._accounts)
+        old_loaded = server.accounts._loaded_from_files
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "acct1.txt"), "w", encoding="utf-8") as fh:
+                    fh.write(JWT_A)
+                result = self._call(JWT_B, tmp, (True, "tester"))
+                self.assertTrue(result["success"])
+                self.assertEqual(result["file"], "acct2.txt")
+                self.assertEqual(result["account"]["valid"], True)
+                self.assertEqual(result["account"]["valid_message"], "tester")
+                self.assertTrue(os.path.isfile(os.path.join(tmp, "acct2.txt")))
+        finally:
+            server.accounts._accounts = old_accounts
+            server.accounts._loaded_from_files = old_loaded
+
+    def test_empty_text_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self._call("   ", tmp, (True, "tester"))
+            self.assertFalse(result["success"])
 
 
 class HeaderTests(unittest.TestCase):
@@ -204,6 +282,14 @@ class DashboardTests(unittest.TestCase):
 
         self.assertIn("j.error", DASHBOARD_HTML)
         self.assertIn("empty stream", DASHBOARD_HTML)
+
+    def test_dashboard_adds_and_deletes_account_files(self):
+        from core.dashboard import DASHBOARD_HTML
+
+        self.assertIn("Add Account", DASHBOARD_HTML)
+        self.assertIn('"/api/accounts"', DASHBOARD_HTML)
+        self.assertIn("deleteAccount", DASHBOARD_HTML)
+        self.assertIn("acctN.txt", DASHBOARD_HTML)
 
 
 if __name__ == "__main__":

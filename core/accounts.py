@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .auth import AuthManager, build_headers, parse_credentials
 from .auth import requests as _requests
@@ -33,6 +34,110 @@ AUTH_FAILURE_COOLDOWN = 30 * 60  # 401/403: the token itself is bad
 RATE_LIMIT_COOLDOWN = 60  # 429 or DeepSeek's "Too many messages"
 SERVER_ERROR_COOLDOWN = 30
 MAX_BACKOFF = 300
+
+# Files created by the dashboard's "Add Account" button (acct1.txt, acct2.txt, ...).
+ACCOUNT_FILE_RE = re.compile(r"^acct(\d+)\.txt$", re.IGNORECASE)
+
+
+def accounts_dir(create: bool = False) -> str:
+    """Directory backing the file account pool.
+
+    Honours ``DEEPSEEK_AUTH_DIR`` and otherwise uses ``<project>/accounts``.
+    Creates the folder when ``create`` is set.
+    """
+    directory = os.environ.get("DEEPSEEK_AUTH_DIR", "").strip()
+    if not directory:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        directory = os.path.join(base, "accounts")
+    if create:
+        os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def _next_account_path(directory: str) -> str:
+    highest = 0
+    for name in os.listdir(directory):
+        match = ACCOUNT_FILE_RE.match(name)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return os.path.join(directory, f"acct{highest + 1}.txt")
+
+
+def save_credential_file(raw_text: str, directory: Optional[str] = None) -> str:
+    """Write pasted credentials to the next free ``acctN.txt`` file.
+
+    The text is stored verbatim (``parse_credentials`` handles JWTs, cookie
+    headers, Netscape files and JSON blobs). Returns the absolute path that was
+    created.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("no credentials provided")
+
+    target_dir = os.path.abspath(directory or accounts_dir(create=True))
+
+    while True:
+        path = _next_account_path(target_dir)
+        try:
+            with open(path, "x", encoding="utf-8", newline="\n") as handle:
+                handle.write(text + "\n")
+            return path
+        except FileExistsError:
+            # Another writer grabbed the same name; recompute and retry.
+            continue
+
+
+def delete_credential_file(name: str, directory: Optional[str] = None) -> bool:
+    """Delete one ``acctN.txt`` credential file. Returns False if missing."""
+    filename = (name or "").strip()
+    if filename != os.path.basename(filename) or not ACCOUNT_FILE_RE.match(filename):
+        raise ValueError("invalid account file name")
+
+    target_dir = os.path.abspath(directory or accounts_dir())
+    path = os.path.abspath(os.path.join(target_dir, filename))
+    if os.path.dirname(path) != target_dir:
+        raise ValueError("invalid account file name")
+
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def probe_credentials(token: Optional[str], cookie: str = "") -> Tuple[bool, str]:
+    """Check a token/cookie pair against ``/api/v0/users/current``.
+
+    Returns ``(valid, message)`` where message is the account nickname, email,
+    an HTTP status or a DeepSeek error string. Never raises.
+    """
+    if not token and not cookie:
+        return False, "no credentials provided"
+
+    try:
+        session = _requests.Session(impersonate="chrome124")
+        resp = session.get(
+            CURRENT_USER_URL,
+            headers=build_headers(token=token, cookie_string=cookie),
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"check failed: {exc}"
+
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return False, "non-JSON response"
+
+    code = body.get("code")
+    if code != 0:
+        return False, f"{body.get('msg', 'invalid')} (code: {code})"
+
+    info = body.get("data") or {}
+    return True, (info.get("nickname") or info.get("email") or "valid")
 
 
 @dataclass
@@ -94,10 +199,7 @@ class AccountPool:
 
     def _credential_paths(self) -> List[str]:
         paths: List[str] = []
-        directory = os.environ.get("DEEPSEEK_AUTH_DIR", "").strip()
-        if not directory or not os.path.isdir(directory):
-            # No env var: fall back to the in-project accounts folder.
-            directory = self._project_accounts_dir() or ""
+        directory = accounts_dir()
         if directory and os.path.isdir(directory):
             for pattern in ("*.json", "*.txt"):
                 paths.extend(sorted(glob.glob(os.path.join(directory, pattern))))
@@ -229,6 +331,16 @@ class AccountPool:
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+    def mark_valid(self, source: str, valid: bool, message: str) -> None:
+        """Cache a validation result for the account loaded from ``source``."""
+        with self._lock:
+            for account in self._accounts:
+                if account.source == source:
+                    account.valid = valid
+                    account.valid_message = message
+                    account.checked_at = time.time()
+                    return
+
     def status(self) -> List[Dict[str, object]]:
         with self._lock:
             return [account.to_public() for account in self._all()]
@@ -265,35 +377,9 @@ class AccountPool:
                 and now - account.checked_at < max_age
             ):
                 continue
-            try:
-                session = _requests.Session(impersonate="chrome124")
-                resp = session.get(
-                    CURRENT_USER_URL,
-                    headers=account.headers(),
-                    timeout=15,
-                )
-                if resp.status_code != 200:
-                    account.valid = False
-                    account.valid_message = f"HTTP {resp.status_code}"
-                else:
-                    body = resp.json()
-                    code = body.get("code")
-                    if code == 0:
-                        account.valid = True
-                        info = body.get("data") or {}
-                        account.valid_message = (
-                            info.get("nickname")
-                            or info.get("email")
-                            or "valid"
-                        )
-                    else:
-                        account.valid = False
-                        account.valid_message = (
-                            f"{body.get('msg', 'invalid')} (code: {code})"
-                        )
-            except Exception as exc:  # noqa: BLE001
-                account.valid = False
-                account.valid_message = f"check failed: {exc}"
+            account.valid, account.valid_message = probe_credentials(
+                account.token, account.cookie
+            )
             account.checked_at = time.time()
 
         return self.status()

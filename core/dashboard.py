@@ -43,6 +43,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill.good{background:rgba(35,134,54,.2);color:#3fb950;border:1px solid var(--green)}
   .pill.bad{background:rgba(248,81,73,.2);color:var(--red);border:1px solid #da3633}
   .pill.warn{background:rgba(210,153,34,.2);color:#d29922;border:1px solid #d29922}
+  .del{background:transparent;border:1px solid var(--border);color:var(--muted);padding:1px 8px;border-radius:6px;font-size:15px;line-height:1.3;margin:0}
+  .del:hover{color:var(--red);border-color:var(--red);background:rgba(248,81,73,.12)}
 </style>
 </head>
 <body>
@@ -54,12 +56,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div class="grid">
   <div>
     <div class="card">
-      <h2>&#128273; Credentials</h2>
-      <small>Paste your <code>userToken</code> (eyJ...) or exported cookies.</small>
+      <h2>&#128273; Add Account</h2>
+      <small>Paste your <code>userToken</code> (eyJ...) or exported cookies. Each token is validated and saved automatically as <code>accounts/acctN.txt</code>.</small>
       <textarea id="creds" placeholder="Paste userToken or cookies here..."></textarea>
       <div style="margin-top:8px">
-        <button onclick="saveCreds()">Save &amp; Connect</button>
-        <button class="alt" onclick="clearCreds()">Clear</button>
+        <button onclick="addAccount()">Add Account</button>
+        <button class="alt" onclick="document.getElementById('creds').value=''">Cancel</button>
       </div>
     </div>
     <div class="card">
@@ -175,7 +177,7 @@ function renderAccounts(list, checked){
   const box = document.getElementById("accounts");
   box.innerHTML = "";
   if (!list.length){
-    box.innerHTML = '<small>No accounts loaded. Drop token files in <code>accounts/</code> and press Reload files.</small>';
+    box.innerHTML = '<small>No accounts yet. Paste a token above and press Add Account.</small>';
     return;
   }
   for (const a of list){
@@ -208,6 +210,15 @@ function renderAccounts(list, checked){
     else if (a.valid === false) { pill.className = "pill bad"; pill.textContent = "invalid"; }
     else { pill.className = "pill warn"; pill.textContent = "unknown"; }
     row.appendChild(pill);
+
+    if ((a.source || "").toLowerCase().endsWith(".txt")) {
+      const del = document.createElement("button");
+      del.className = "del";
+      del.title = "Delete " + a.source;
+      del.textContent = "\u00d7";
+      del.onclick = () => deleteAccount(a.source);
+      row.appendChild(del);
+    }
 
     box.appendChild(row);
   }
@@ -246,28 +257,37 @@ async function reloadAccounts(){
   refreshAccounts(true);
 }
 
-async function saveCreds(){
-  const raw = document.getElementById("creds").value.trim();
-  if (!raw) return alert("Paste credentials first.");
-  const r = await apiFetch("/api/cookies", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({raw_text: raw})
-  });
-  const d = await r.json();
-  alert(d.message);
-  if (d.success) document.getElementById("creds").value = "";
-  checkStatus();
+async function addAccount(){
+  const box = document.getElementById("creds");
+  const raw = box.value.trim();
+  if (!raw) return alert("Paste a token or cookies first.");
+  try {
+    const r = await apiFetch("/api/accounts", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({raw_text: raw})
+    });
+    const d = await r.json();
+    alert(d.message || (d.success ? "Account added." : "Could not add account."));
+    if (d.success) {
+      box.value = "";
+      refreshAccounts(true);
+    }
+  } catch(e) {
+    alert("Could not add account: " + e.message);
+  }
 }
 
-async function clearCreds(){
-  if (!confirm("Clear stored credentials?")) return;
-  await apiFetch("/api/cookies", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({raw_text: ""})
-  });
-  checkStatus();
+async function deleteAccount(name){
+  if (!confirm("Delete " + name + "? This removes the credential file.")) return;
+  try {
+    const r = await apiFetch("/api/accounts/" + encodeURIComponent(name), {method: "DELETE"});
+    const d = await r.json();
+    if (!d.success) alert(d.message || "Could not delete account.");
+  } catch(e) {
+    alert("Could not delete account: " + e.message);
+  }
+  refreshAccounts(true);
 }
 
 async function send(){
