@@ -275,7 +275,7 @@ class DashboardTests(unittest.TestCase):
         # DASHBOARD_HTML is a raw string, so JS escapes must appear once.
         self.assertIn(r'buf.split("\n")', DASHBOARD_HTML)
         self.assertNotIn(r'buf.split("\\n")', DASHBOARD_HTML)
-        self.assertIn(r'"\u25CF Connected"', DASHBOARD_HTML)
+        self.assertIn(r'"\u25CF " + parts.join(" + ")', DASHBOARD_HTML)
 
     def test_dashboard_surfaces_stream_errors(self):
         from core.dashboard import DASHBOARD_HTML

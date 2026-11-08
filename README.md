@@ -1,20 +1,22 @@
-# DeepSeek Web2API v2
+# DeepSeek + Gemini Web2API v2
 
-**Use your DeepSeek web account as a local OpenAI-compatible API.**
+**Use your DeepSeek and Gemini web accounts as a local OpenAI-compatible API.**
 
 Runs a small FastAPI server on `http://localhost:8084` that speaks the OpenAI
 `/v1/chat/completions` protocol and forwards requests to `chat.deepseek.com`
-using your own logged-in session. Works with any OpenAI-compatible client
-(OpenCode, Cursor, Continue, LiteLLM, the OpenAI Python/JS SDK, etc.).
+or `gemini.google.com` using your own logged-in sessions. Pick the provider
+with the model name: `deepseek-*` goes to DeepSeek, `gemini-*` goes to Google.
+Works with any OpenAI-compatible client (OpenCode, Cursor, Continue, LiteLLM,
+the OpenAI Python/JS SDK, etc.).
 
 ![OpenCode using DeepSeek Web2API](docs/opencode-preview.png)
 
 ![DeepSeek Web2API dashboard](docs/dashboard.png)
 
 > ⚠️ **Disclaimer** — This project is unofficial and not affiliated with
-> DeepSeek. It relies on private web endpoints and may break at any time.
-> Use it for personal experimentation only and respect DeepSeek's Terms of
-> Service. Never commit your credentials.
+> DeepSeek or Google. It relies on private web endpoints and may break at any
+> time. Use it for personal experimentation only and respect the providers'
+> Terms of Service. Never commit your credentials.
 
 ---
 
@@ -44,14 +46,18 @@ using your own logged-in session. Works with any OpenAI-compatible client
   vision pipeline.
 - 🎛️ **Web dashboard** — add tokens with one click (auto-saved as
   `accounts/acctN.txt`), check status and test chat at `http://localhost:8084`.
+- ✨ **Gemini web support** — paste `__Secure-1PSID` / `__Secure-1PSIDTS`
+  cookies once; `gemini-flash`, `gemini-pro` and `gemini-flash-lite` become
+  available through the same OpenAI endpoint. Cookies rotate automatically.
 - 🐧 **Windows + Linux/macOS** — ships with both `.bat` and `.sh` launchers.
 
 ---
 
 ## Requirements
 
-- **Python 3.10+**
-- A DeepSeek account (https://chat.deepseek.com)
+- **Python 3.11+**
+- A DeepSeek account (https://chat.deepseek.com) and/or a Google account with
+  Gemini access (https://gemini.google.com)
 - Internet access
 
 ---
@@ -130,18 +136,59 @@ or a localStorage JSON blob. It extracts `userToken` automatically.
 
 ---
 
+## Getting your Gemini cookies
+
+Gemini's web app has no official API. The proxy drives the same private RPC the
+browser uses, authenticated by two Google cookies:
+
+- `__Secure-1PSID` (required)
+- `__Secure-1PSIDTS` (strongly recommended; rotated automatically afterwards)
+
+### Fastest path
+
+1. Open [gemini.google.com](https://gemini.google.com) and make sure you are
+   signed in.
+2. Press `F12` → **Application** (Chrome/Edge) or **Storage** (Firefox) →
+   **Cookies** → `https://gemini.google.com`.
+3. Copy `__Secure-1PSID` and `__Secure-1PSIDTS`.
+4. Open `http://localhost:8084`, paste them into the **Gemini Web** box (any
+   format works: JSON, `Cookie:` header, Netscape `cookies.txt`, or two bare
+   values) and press **Connect Gemini**.
+5. The server validates them against Google before saving. The pair is stored
+   in `gemini_cookies.json` (git-ignored); rotated values are written back
+   automatically.
+
+> 🔒 **Keep it secret.** These cookies grant full access to your Google
+> account's Gemini session. Do not commit `gemini_cookies.json` or paste it in
+> an issue. To revoke access, sign out of Gemini (or change your Google
+> password), then press **Disconnect** in the dashboard.
+
+Only one Gemini account is supported. If you need several Google accounts,
+run a second instance of the proxy with a different `PROXY_PORT`.
+
+---
+
 ## Models
 
-| Model ID | Description |
-|---|---|
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | Fast default model |
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017-search` | Fast model + web search |
-| `deepseek-chat` | DeepSeek V3 (fast) |
-| `deepseek-search` | DeepSeek V3 + web search |
-| `deepseek-reasoner` | Reasoning / thinking model |
-| `deepseek-reasoner-search` | Reasoning + web search |
+| Model ID | Provider | Description |
+|---|---|---|
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017` | DeepSeek | Fast default model |
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017-search` | DeepSeek | Fast model + web search |
+| `deepseek-chat` | DeepSeek | DeepSeek V3 (fast) |
+| `deepseek-search` | DeepSeek | DeepSeek V3 + web search |
+| `deepseek-reasoner` | DeepSeek | Reasoning / thinking model |
+| `deepseek-reasoner-search` | DeepSeek | Reasoning + web search |
+| `gemini-flash` | Gemini | Gemini Flash via the web app |
+| `gemini-pro` | Gemini | Gemini Pro via the web app |
+| `gemini-flash-lite` | Gemini | Cheapest/fastest Gemini tier |
 
-You can also force behaviour per request with `search_enabled` and
+Routing is by model name: anything starting with `gemini` goes to Google,
+everything else goes to DeepSeek. After connecting a Gemini account,
+`GET /v1/models` also lists the exact model names Google reports for that
+account. Gemini replies are stateless: the full message history is sent on
+every request, so no `x-agent-session` state is kept for Gemini.
+
+You can also force DeepSeek behaviour per request with `search_enabled` and
 `thinking_enabled` boolean fields in the request body.
 
 ---
@@ -216,6 +263,21 @@ curl http://localhost:8084/v1/chat/completions \
   }'
 ```
 
+### Gemini chat completion
+
+```bash
+curl http://localhost:8084/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-flash",
+    "messages": [{"role": "user", "content": "Hello from Gemini!"}]
+  }'
+```
+
+`stream: true`, `tools`, and inline `data:` images work the same way as for
+DeepSeek. If Gemini has not been connected yet, the request returns
+**HTTP 401** with a message pointing at the dashboard.
+
 ### OpenAI Python SDK
 
 ```python
@@ -278,6 +340,18 @@ Add this provider to your OpenCode config
         "deepseek-chat": {
           "name": "DeepSeek V3 (Fast)",
           "limit": { "context": 128000, "output": 8192 }
+        },
+        "gemini-flash": {
+          "name": "Gemini Flash (web)",
+          "limit": { "context": 1000000, "output": 8192 }
+        },
+        "gemini-pro": {
+          "name": "Gemini Pro (web)",
+          "limit": { "context": 1000000, "output": 65536 }
+        },
+        "gemini-flash-lite": {
+          "name": "Gemini Flash Lite (web)",
+          "limit": { "context": 1000000, "output": 8192 }
         }
       }
     }
@@ -327,6 +401,9 @@ litellm --config litellm_config.yaml --port 4000
 | `GET` | `/api/status` | Auth status and user info |
 | `POST` | `/api/accounts` | Validate a token and save it as `accounts/acctN.txt` |
 | `DELETE` | `/api/accounts/{file}` | Delete one `acctN.txt` credential file |
+| `GET` | `/api/gemini` | Gemini cookie/connection status |
+| `POST` | `/api/gemini` | Validate + save Gemini cookies (empty body re-checks saved ones) |
+| `DELETE` | `/api/gemini` | Forget saved Gemini cookies and close the client |
 | `POST` | `/api/cookies` | Legacy single-account save (writes `config.json`) |
 | `GET` | `/v1/models` | List available models |
 | `POST` | `/v1/chat/completions` | Chat completion (stream or not) |
@@ -386,6 +463,28 @@ account read from `config.json` in the project root:
 `config.json` and `cookie_deepseek.txt` are **git-ignored**. A safe template
 lives in `config.example.json` — copy it to `config.json` and fill in your own
 values, or just use the dashboard.
+
+### Gemini
+
+Gemini settings are kept separately from the DeepSeek pool:
+
+```json
+{
+  "secure_1psid": "...",
+  "secure_1psidts": "...",
+  "updated_at": 0
+}
+```
+
+The file is `gemini_cookies.json` in the project root and is **git-ignored**.
+Refreshed `__Secure-1PSIDTS` values are copied back automatically after each
+request, and `gemini_webapi` keeps its own rotation cache in `gemini_cache/`
+(also git-ignored). Delete both, or press **Disconnect** in the dashboard, to
+start over with another Google account.
+
+Gemini requests are stateless (full history each turn), so the DeepSeek
+session headers do not affect them. Tool calls reuse the same JSON-envelope
+parser and the same one-shot self-correction retry.
 
 ### Multi-account
 
@@ -479,6 +578,10 @@ or in the dashboard.
 | `DEEPSEEK_MAX_MESSAGE_DEPTH` | `100` | Turns before reset |
 | `DEEPSEEK_MAX_PROMPT_CHARS` | `80000` | Prompt size limit |
 | `DEEPSEEK_MAX_SESSION_CHARS` | `240000` | Accumulated session chars |
+| `GEMINI_CONNECT_TIMEOUT_S` | `45` | Gemini cookie validation timeout |
+| `GEMINI_REQUEST_TIMEOUT_S` | `300` | Non-stream Gemini reply timeout |
+| `GEMINI_STREAM_IDLE_TIMEOUT_S` | `90` | Abort a stalled Gemini stream |
+| `GEMINI_STREAM_MAX_S` | `600` | Hard cap for one Gemini stream |
 
 > The dashboard and the `/api/*` account endpoints are protected by
 > `PROXY_API_KEY` when it is set. Use `curl -H "Authorization: Bearer $PROXY_API_KEY" ...`
@@ -495,6 +598,9 @@ or in the dashboard.
 - Image input accepts **inline `data:` URIs only**. Remote URLs are never
   fetched, so this proxy cannot be used as an SSRF gadget against internal
   networks or cloud metadata endpoints.
+- Gemini cookies grant access to your Google account's Gemini session. They are
+  stored in the git-ignored `gemini_cookies.json`, never logged, and never sent
+  anywhere except `gemini.google.com`. Treat them like a password.
 
 ---
 
@@ -507,6 +613,10 @@ or in the dashboard.
 | `502 DeepSeek returned an empty response` | Upstream sent an empty stream (usually rate limiting). Back off and retry. |
 | Process aborts with `panicked at crates/unwinder/src/stackwalk.rs` | Fixed: the WASM PoW store is now serialized. If you see it, you are running an old copy. |
 | `Validation failed` | Token expired — log in again and copy a fresh one. |
+| `401 Gemini is not configured` | Paste cookies in the dashboard's **Gemini Web** card. |
+| `Gemini account unavailable (...)` | Cookies expired or Gemini is blocked in your region — sign in again and copy fresh cookies; a VPN may be required. |
+| Gemini replies are very slow | `gemini-pro` thinks before answering. Use `gemini-flash` or raise `GEMINI_REQUEST_TIMEOUT_S`. |
+| Gemini tool calls loop or fail | Retry; Gemini occasionally ignores the JSON envelope. The proxy retries once with self-correction, then returns HTTP 502. |
 | `pip install` fails on Linux | Install `python3-venv` (`sudo apt install python3-venv`). |
 | `wasmtime` install error | Use Python 3.10–3.12; ensure wheels are available for your platform. |
 | Browser doesn't open | Headless server — just visit the URL manually. |
@@ -524,6 +634,7 @@ the same agent id in parallel can interleave session state.
 | N agents, distinct ids, parallel | Works |
 | N agents, same account, parallel | Works, higher upstream rate-limit risk |
 | Same agent id, parallel | Not safe — session state can interleave |
+| Gemini, parallel requests | Serialized behind one lock (single Google account) |
 | PoW under parallelism | Safe (serialized by `_SOLVER_LOCK`) |
 
 Known unguarded spots (documented, not yet fixed):
@@ -545,4 +656,9 @@ live in `docs/concurrency-notes.md`.
 
 ## License
 
-Provided as-is for educational and personal use. Not affiliated with DeepSeek.
+Provided as-is for educational and personal use. Not affiliated with DeepSeek
+or Google.
+
+Gemini support depends on [gemini-webapi](https://github.com/HanaokaYuzu/Gemini-API),
+which is licensed **AGPL-3.0**. If you redistribute this project with Gemini
+enabled, that dependency's license applies to the combined work.

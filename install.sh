@@ -2,7 +2,7 @@
 set -u
 
 echo "==================================================="
-echo "       DeepSeek Web2API - Dependency Installer"
+echo "       DeepSeek + Gemini Web2API - Dependency Installer"
 echo "==================================================="
 echo
 
@@ -17,7 +17,7 @@ done
 
 if [ -z "$PY" ]; then
     echo "[ERROR] Python is not installed or not in PATH!"
-    echo "Please install Python 3.10+ and try again."
+    echo "Please install Python 3.11+ and try again."
     exit 1
 fi
 
@@ -51,5 +51,5 @@ fi
 
 echo
 echo "[OK] Installation complete!"
-echo "You can now run ./start.sh to launch DeepSeek Web2API."
+echo "You can now run ./start.sh to launch DeepSeek + Gemini Web2API."
 echo

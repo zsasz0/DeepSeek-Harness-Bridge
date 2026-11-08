@@ -1,6 +1,8 @@
 # Credentials (NEVER commit these)
 config.json
 cookie_deepseek.txt
+gemini_cookies.json
+gemini_cache/
 
 # Python
 __pycache__/

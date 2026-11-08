@@ -1,4 +1,4 @@
-"""DeepSeek Web2API v2 - entry point."""
+"""DeepSeek + Gemini Web2API v2 - entry point."""
 
 from __future__ import annotations
 
@@ -44,11 +44,11 @@ def main() -> None:
     if not loopback and not os.environ.get("PROXY_API_KEY", "").strip():
         print(
             "[!] WARNING: binding to a non-loopback address without PROXY_API_KEY. "
-            "Anyone on the network can use your DeepSeek account."
+            "Anyone on the network can use your DeepSeek and Gemini accounts."
         )
 
     url = f"http://{'localhost' if loopback else host}:{port}"
-    print(f"\nStarting DeepSeek Web2API on http://{host}:{port}")
+    print(f"\nStarting DeepSeek + Gemini Web2API on http://{host}:{port}")
     print(f"OpenAI endpoint: {url}/v1/chat/completions")
     print(f"Dashboard:       {url}\n")
 

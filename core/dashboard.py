@@ -5,7 +5,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DeepSeek Web2API v2</title>
+<title>DeepSeek + Gemini Web2API</title>
 <style>
   :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--green:#238636;--blue:#58a6ff;--red:#f85149;--code:#090d13}
   *{box-sizing:border-box;margin:0;padding:0}
@@ -49,7 +49,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>&#9889; DeepSeek Web2API <small>v2</small></h1>
+  <h1>&#9889; DeepSeek + Gemini <small>Web2API v2</small></h1>
   <div><span id="badge" class="badge bad">&#9679; Checking...</span></div>
 </header>
 
@@ -73,6 +73,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
     <div class="card">
+      <h2>&#10024; Gemini Web</h2>
+      <div id="geminiStatus"><small>Checking...</small></div>
+      <small>Paste <code>__Secure-1PSID</code> + <code>__Secure-1PSIDTS</code> from <code>gemini.google.com</code> (JSON export, Cookie header, or cookies.txt).</small>
+      <textarea id="geminiCookies" placeholder="Paste Gemini cookies here..."></textarea>
+      <div style="margin-top:8px">
+        <button onclick="connectGemini()">Connect Gemini</button>
+        <button class="alt" onclick="verifyGemini()">Verify</button>
+        <button class="alt" onclick="disconnectGemini()">Disconnect</button>
+      </div>
+      <small>Use model names starting with <code>gemini-</code>, e.g. <code>gemini-flash</code> or <code>gemini-pro</code>.</small>
+    </div>
+    <div class="card">
       <h2>&#128187; OpenCode Config</h2>
       <pre id="snippet"></pre>
       <button onclick="copySnippet()">Copy</button>
@@ -87,10 +99,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <option value="deepseek-ai/DeepSeek-V4.1-Flash-1017-search">V4.1 Flash + Search</option>
         <option value="deepseek-reasoner">R1 (Thinking)</option>
         <option value="deepseek-chat">V3 (Chat)</option>
+        <option value="gemini-flash">Gemini Flash (web)</option>
+        <option value="gemini-pro">Gemini Pro (web)</option>
+        <option value="gemini-flash-lite">Gemini Flash Lite (web)</option>
       </select>
       <div id="chat" class="chat"><small>Send a prompt to test your connection.</small></div>
       <div class="row">
-        <input id="prompt" placeholder="Ask DeepSeek..." onkeydown="if(event.key==='Enter')send()">
+        <input id="prompt" placeholder="Ask DeepSeek or Gemini..." onkeydown="if(event.key==='Enter')send()">
         <button id="sendBtn" onclick="send()">Send</button>
       </div>
     </div>
@@ -117,7 +132,10 @@ const CONFIG = {
         "deepseek-ai/DeepSeek-V4.1-Flash-1017": { name: "DeepSeek V4.1 Flash" },
         "deepseek-ai/DeepSeek-V4.1-Flash-1017-search": { name: "DeepSeek V4.1 Flash + Search" },
         "deepseek-reasoner": { name: "DeepSeek R1" },
-        "deepseek-chat": { name: "DeepSeek V3" }
+        "deepseek-chat": { name: "DeepSeek V3" },
+        "gemini-flash": { name: "Gemini Flash (web)" },
+        "gemini-pro": { name: "Gemini Pro (web)" },
+        "gemini-flash-lite": { name: "Gemini Flash Lite (web)" }
       }
     }
   }
@@ -147,18 +165,32 @@ async function apiFetch(url, options){
   return r;
 }
 
+let dsValid = 0, dsTotal = 0;
+let geminiState = {configured: false, connected: false, message: "", models: []};
+
+function updateBadge(){
+  const b = document.getElementById("badge");
+  const parts = [];
+  if (dsValid > 0) parts.push(dsValid + "/" + dsTotal + " DeepSeek");
+  else if (dsTotal > 0) parts.push("DeepSeek invalid");
+  if (geminiState.connected) parts.push("Gemini");
+  if (parts.length){
+    b.className = "badge ok";
+    b.textContent = "\u25CF " + parts.join(" + ");
+  } else {
+    b.className = "badge bad";
+    b.textContent = "\u25CF " + (geminiState.configured ? "Gemini saved (unverified)" : "Disconnected");
+  }
+}
+
 async function checkStatus(){
   const b = document.getElementById("badge");
   try {
     const r = await apiFetch("/api/status");
     const d = await r.json();
-    if (d.authenticated) {
-      b.className = "badge ok";
-      b.textContent = "\u25CF Connected";
-    } else {
-      b.className = "badge bad";
-      b.textContent = "\u25CF " + (d.message || "Disconnected");
-    }
+    if (d.gemini) geminiState = d.gemini;
+    if (d.authenticated && dsTotal === 0){ dsValid = 1; dsTotal = 1; }
+    updateBadge();
   } catch(e) {
     b.className = "badge bad";
     b.textContent = "\u25CF Server unreachable";
@@ -236,15 +268,9 @@ async function refreshAccounts(force){
     const r = await apiFetch("/v1/accounts" + (force ? "?validate=1" : ""), {method: force ? "POST" : "GET"});
     const d = await r.json();
     renderAccounts(d.data || [], force);
-    const ready = (d.data || []).filter(a => a.valid === true).length;
-    const b = document.getElementById("badge");
-    if (ready > 0) {
-      b.className = "badge ok";
-      b.textContent = "\u25CF " + ready + "/" + d.data.length + " accounts valid";
-    } else {
-      b.className = "badge bad";
-      b.textContent = "\u25CF No valid accounts";
-    }
+    dsValid = (d.data || []).filter(a => a.valid === true).length;
+    dsTotal = (d.data || []).length;
+    updateBadge();
   } catch(e) {
     box.innerHTML = '<small>Could not load accounts: ' + e.message + '</small>';
   }
@@ -288,6 +314,91 @@ async function deleteAccount(name){
     alert("Could not delete account: " + e.message);
   }
   refreshAccounts(true);
+}
+
+function renderGemini(s){
+  const box = document.getElementById("geminiStatus");
+  box.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "acct";
+
+  const dot = document.createElement("span");
+  dot.className = "dot " + (s.connected ? "good" : s.configured ? "unknown" : "bad");
+  row.appendChild(dot);
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const name = document.createElement("div");
+  name.className = "name";
+  name.textContent = s.connected ? "Gemini connected" : s.configured ? "Gemini cookies saved" : "Gemini not configured";
+  const msg = document.createElement("div");
+  msg.className = "msg";
+  const models = (s.models || []).slice(0, 4).join(", ");
+  msg.textContent = (s.message || "") + (models ? " \u00b7 " + models : "");
+  meta.appendChild(name);
+  meta.appendChild(msg);
+  row.appendChild(meta);
+
+  const pill = document.createElement("span");
+  pill.className = "pill " + (s.connected ? "good" : s.configured ? "warn" : "bad");
+  pill.textContent = s.connected ? "live" : s.configured ? "saved" : "off";
+  row.appendChild(pill);
+
+  box.appendChild(row);
+}
+
+async function refreshGemini(){
+  try {
+    const r = await apiFetch("/api/gemini");
+    const s = await r.json();
+    geminiState = s;
+    renderGemini(s);
+    updateBadge();
+  } catch(e) {
+    document.getElementById("geminiStatus").innerHTML = '<small>Could not load Gemini status: ' + e.message + '</small>';
+  }
+}
+
+async function connectGemini(){
+  const box = document.getElementById("geminiCookies");
+  const raw = box.value.trim();
+  if (!raw) return alert("Paste your Gemini cookies first.");
+  try {
+    const r = await apiFetch("/api/gemini", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({raw_text: raw})
+    });
+    const d = await r.json();
+    alert(d.message || (d.success ? "Gemini connected." : "Could not connect Gemini."));
+    if (d.success) {
+      box.value = "";
+      refreshGemini();
+    }
+  } catch(e) {
+    alert("Could not connect Gemini: " + e.message);
+  }
+}
+
+async function verifyGemini(){
+  try {
+    const r = await apiFetch("/api/gemini", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({raw_text: ""})
+    });
+    const d = await r.json();
+    alert(d.message || (d.success ? "Gemini verified." : "Gemini verification failed."));
+    refreshGemini();
+  } catch(e) {
+    alert("Could not verify Gemini: " + e.message);
+  }
+}
+
+async function disconnectGemini(){
+  if (!confirm("Remove saved Gemini cookies?")) return;
+  try { await apiFetch("/api/gemini", {method: "DELETE"}); } catch(e) {}
+  refreshGemini();
 }
 
 async function send(){
@@ -380,7 +491,9 @@ async function send(){
 
 checkStatus();
 refreshAccounts(true);
+refreshGemini();
 setInterval(() => refreshAccounts(false), 60000);
+setInterval(() => refreshGemini(), 120000);
 </script>
 </body>
 </html>

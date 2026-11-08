@@ -11,6 +11,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -29,6 +31,14 @@ from core.accounts import (
 from core.auth import AuthManager, parse_credentials
 from core.client import DeepSeekWebClient, HTTPStatusError, StreamStalled
 from core.dashboard import DASHBOARD_HTML
+from core.gemini import (
+    GeminiAuthError,
+    GeminiError,
+    GeminiModelError,
+    GeminiNotConfigured,
+    gemini,
+    is_gemini_model,
+)
 from core.openai_adapter import (
     AVAILABLE_MODELS,
     format_messages_to_prompt,
@@ -188,6 +198,7 @@ async def health_check() -> Dict[str, Any]:
         "accounts": len(pool),
         "accounts_ready": sum(1 for account in pool if account["ready"]),
         "accounts_valid": sum(1 for account in pool if account["valid"] is True),
+        "gemini": gemini.status(),
     }
 
 
@@ -195,10 +206,17 @@ async def health_check() -> Dict[str, Any]:
 async def ready_check() -> Dict[str, Any]:
     pool = accounts.status()
     ready = sum(1 for account in pool if account["ready"])
+    if not ready and not gemini.status()["connected"]:
+        return {
+            "status": "degraded",
+            "accounts": len(pool),
+            "ready": 0,
+        }
     return {
-        "status": "ok" if ready else "degraded",
+        "status": "ok",
         "accounts": len(pool),
         "ready": ready,
+        "gemini_connected": gemini.status()["connected"],
     }
 
 
@@ -206,23 +224,33 @@ async def ready_check() -> Dict[str, Any]:
 async def get_status() -> Dict[str, Any]:
     if auth_manager.token:
         is_valid, user_info, message = auth_manager.validate_session()
-        return {"authenticated": is_valid, "user": user_info, "message": message}
-
-    pool = accounts.status()
-    if not pool:
-        return {"authenticated": False, "message": "No token provided"}
-
-    valid = next((account for account in pool if account["valid"] is True), None)
-    if valid:
-        return {
-            "authenticated": True,
-            "user": {"nickname": valid["valid_message"]},
-            "message": f"{len(pool)} account(s) loaded",
+        payload: Dict[str, Any] = {
+            "authenticated": is_valid,
+            "user": user_info,
+            "message": message,
         }
-    return {
-        "authenticated": False,
-        "message": "No valid accounts; check the Accounts panel.",
-    }
+    else:
+        pool = accounts.status()
+        if not pool:
+            payload = {"authenticated": False, "message": "No token provided"}
+        else:
+            valid = next(
+                (account for account in pool if account["valid"] is True), None
+            )
+            if valid:
+                payload = {
+                    "authenticated": True,
+                    "user": {"nickname": valid["valid_message"]},
+                    "message": f"{len(pool)} account(s) loaded",
+                }
+            else:
+                payload = {
+                    "authenticated": False,
+                    "message": "No valid accounts; check the Accounts panel.",
+                }
+
+    payload["gemini"] = gemini.status()
+    return payload
 
 
 @app.post("/api/accounts")
@@ -281,6 +309,28 @@ def remove_account(filename: str) -> Dict[str, Any]:
     }
 
 
+@app.get("/api/gemini")
+def gemini_status() -> Dict[str, Any]:
+    """Report whether Gemini cookies are saved and connected."""
+    return gemini.status()
+
+
+@app.post("/api/gemini")
+def gemini_connect(req: AccountCreateRequest) -> Dict[str, Any]:
+    """Validate and save Gemini web cookies.
+
+    An empty ``raw_text`` re-checks the cookies already saved on disk.
+    """
+    raw = req.raw_text.strip()
+    return gemini.connect(raw_text=raw or None)
+
+
+@app.delete("/api/gemini")
+def gemini_disconnect() -> Dict[str, Any]:
+    """Forget the saved Gemini cookies and close the client."""
+    return gemini.disconnect()
+
+
 @app.post("/api/cookies")
 async def update_cookies(req: CookieUpdateRequest) -> Dict[str, Any]:
     raw = req.raw_text.strip()
@@ -309,7 +359,7 @@ async def update_cookies(req: CookieUpdateRequest) -> Dict[str, Any]:
 
 @app.get("/v1/models")
 async def list_models() -> Dict[str, Any]:
-    return {"object": "list", "data": AVAILABLE_MODELS}
+    return {"object": "list", "data": AVAILABLE_MODELS + gemini.model_entries()}
 
 
 @app.get("/v1/sessions")
@@ -574,6 +624,304 @@ def _account_failure(agent, account, exc: HTTPStatusError) -> HTTPException:
     )
 
 
+# ----------------------------------------------------------------------
+# Gemini (gemini.google.com) completions
+# ----------------------------------------------------------------------
+def _gemini_image_files(urls: List[str]):
+    """Write inline data: images to temp files for gemini_webapi."""
+    paths: List[str] = []
+    tempdir: Optional[str] = None
+    for url in urls:
+        if not url.startswith("data:"):
+            print("[gemini] skipping non-inline image url (SSRF protection)")
+            continue
+        header, _, b64 = url.partition(",")
+        mime = header[5:].split(";")[0] or "image/png"
+        try:
+            data = base64.b64decode(b64)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail=f"invalid base64 image payload: {exc}"
+            ) from exc
+        if tempdir is None:
+            tempdir = tempfile.mkdtemp(prefix="gemini-img-")
+        ext = _EXT_BY_MIME.get(mime, "png")
+        path = os.path.join(tempdir, f"image{len(paths)}.{ext}")
+        with open(path, "wb") as handle:
+            handle.write(data)
+        paths.append(path)
+
+    def cleanup() -> None:
+        if tempdir:
+            shutil.rmtree(tempdir, ignore_errors=True)
+
+    return paths, cleanup
+
+
+def _gemini_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, (GeminiNotConfigured, GeminiAuthError)):
+        return HTTPException(status_code=401, detail=str(exc))
+    if isinstance(exc, GeminiModelError):
+        return HTTPException(status_code=400, detail=str(exc))
+    text = str(exc)
+    lowered = text.lower()
+    if (
+        isinstance(exc, TimeoutError)
+        or "timed out" in lowered
+        or "stalled" in lowered
+        or "exceeded" in lowered
+    ):
+        return HTTPException(
+            status_code=504, detail=text, headers={"Retry-After": "30"}
+        )
+    return HTTPException(status_code=502, detail=f"Gemini error: {text}")
+
+
+def _gemini_generate(
+    prompt: str,
+    model: str,
+    files: List[str],
+    tools: Optional[List[Dict[str, Any]]],
+):
+    """Collect one Gemini reply, retrying once on an unparsable tool envelope."""
+    text, thinking = gemini.complete(prompt, model=model, files=files)
+    content, calls, attempted = parse_envelope_tool_calls(text, tools)
+
+    if not calls and attempted and tools:
+        print("[gemini] tool-call parse failed; retrying with self-correction")
+        retry, thinking2 = gemini.complete(
+            _retry_prompt(prompt, text, tools), model=model, files=files
+        )
+        content, calls, attempted = parse_envelope_tool_calls(retry, tools)
+        thinking = thinking or thinking2
+        if retry:
+            text = retry
+
+    if not calls and attempted:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini attempted a tool call that could not be parsed",
+        )
+    if not calls and not content:
+        raise HTTPException(status_code=502, detail="Gemini returned an empty response")
+    return content, calls, thinking, text
+
+
+def _gemini_chat_completion(req: ChatCompletionRequest):
+    """OpenAI-compatible completion backed by a Gemini web account."""
+    status = gemini.status()
+    if not status["configured"]:
+        raise HTTPException(
+            status_code=401,
+            detail=status.get("message")
+            or (
+                "Gemini is not configured. Open http://localhost:8084 and add "
+                "your Gemini cookies."
+            ),
+        )
+
+    prompt = format_messages_to_prompt(req.messages, tools=req.tools)
+    image_urls = _collect_images(req.messages)
+    if not prompt and not image_urls:
+        raise HTTPException(status_code=400, detail="Empty prompt / messages.")
+
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    prompt_tokens = _count_message_tokens(req.messages)
+    files, cleanup = _gemini_image_files(image_urls)
+    want_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
+
+    # No tools: forward Gemini's stream as soon as it arrives.
+    if req.stream and not req.tools:
+
+        def live_event_stream():
+            text_parts: List[str] = []
+            thinking_parts: List[str] = []
+            emitted_role = False
+            try:
+                for kind, delta in gemini.stream(
+                    prompt, model=req.model, files=files
+                ):
+                    if not delta:
+                        continue
+                    if kind == "thinking":
+                        thinking_parts.append(delta)
+                        yield make_chunk_sse(
+                            completion_id, req.model, {"reasoning_content": delta}
+                        )
+                    else:
+                        text_parts.append(delta)
+                        payload: Dict[str, Any] = {"content": delta}
+                        if not emitted_role:
+                            payload = {"role": "assistant", **payload}
+                            emitted_role = True
+                        yield make_chunk_sse(completion_id, req.model, payload)
+
+                full_text = "".join(text_parts)
+                if not emitted_role and not full_text.strip():
+                    raise GeminiError("Gemini returned an empty response")
+                if not emitted_role:
+                    yield make_chunk_sse(
+                        completion_id,
+                        req.model,
+                        {"role": "assistant", "content": ""},
+                    )
+                yield make_chunk_sse(
+                    completion_id, req.model, {}, finish_reason="stop"
+                )
+                if want_usage:
+                    yield make_usage_chunk(
+                        completion_id,
+                        req.model,
+                        prompt_tokens,
+                        _estimate_tokens(full_text),
+                    )
+                yield make_done_sse()
+            except Exception as exc:  # noqa: BLE001 - headers already sent
+                print("GEMINI STREAM ERROR:", exc)
+                err = {
+                    "error": {
+                        "message": str(exc),
+                        "type": "upstream_error",
+                    }
+                }
+                yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                yield make_done_sse()
+            finally:
+                cleanup()
+
+        return StreamingResponse(
+            live_event_stream(), media_type="text/event-stream"
+        )
+
+    try:
+        content, calls, thinking, raw_text = _gemini_generate(
+            prompt, req.model, files, req.tools
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _gemini_http_error(exc) from exc
+    finally:
+        cleanup()
+
+    completion_tokens = _estimate_tokens(raw_text)
+
+    # Tools were requested: buffer the reply so the JSON envelope can be parsed
+    # before emitting proper tool-call deltas.
+    if req.stream:
+
+        def buffered_event_stream():
+            emitted_role = False
+            try:
+                if thinking:
+                    yield make_chunk_sse(
+                        completion_id, req.model, {"reasoning_content": thinking}
+                    )
+                if content:
+                    yield make_chunk_sse(
+                        completion_id,
+                        req.model,
+                        {"role": "assistant", "content": content},
+                    )
+                    emitted_role = True
+
+                if calls:
+                    for index, call in enumerate(calls):
+                        delta: Dict[str, Any] = {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": call["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": call["function"]["name"],
+                                        "arguments": "",
+                                    },
+                                }
+                            ]
+                        }
+                        if not emitted_role:
+                            delta = {"role": "assistant", **delta}
+                            emitted_role = True
+                        yield make_chunk_sse(completion_id, req.model, delta)
+
+                    for index, call in enumerate(calls):
+                        yield make_chunk_sse(
+                            completion_id,
+                            req.model,
+                            {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "function": {
+                                            "arguments": call["function"]["arguments"]
+                                        },
+                                    }
+                                ]
+                            },
+                        )
+
+                    yield make_chunk_sse(
+                        completion_id, req.model, {}, finish_reason="tool_calls"
+                    )
+                else:
+                    if not emitted_role:
+                        yield make_chunk_sse(
+                            completion_id,
+                            req.model,
+                            {"role": "assistant", "content": ""},
+                        )
+                    yield make_chunk_sse(
+                        completion_id, req.model, {}, finish_reason="stop"
+                    )
+
+                if want_usage:
+                    yield make_usage_chunk(
+                        completion_id, req.model, prompt_tokens, completion_tokens
+                    )
+                yield make_done_sse()
+            except Exception as exc:  # noqa: BLE001 - headers already sent
+                print("GEMINI STREAM ERROR:", exc)
+                err = {"error": {"message": str(exc), "type": "upstream_error"}}
+                yield f"data: {json.dumps(err, separators=(',', ':'))}\n\n"
+                yield make_done_sse()
+
+        return StreamingResponse(
+            buffered_event_stream(), media_type="text/event-stream"
+        )
+
+    if calls:
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": _assistant_message(content, thinking, calls),
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
+
+    return make_full_response(
+        completion_id=completion_id,
+        model=req.model,
+        content=content,
+        reasoning_content=thinking or None,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
 @app.post("/v1/chat/completions")
 def create_chat_completion(
     req: ChatCompletionRequest,
@@ -581,6 +929,9 @@ def create_chat_completion(
     session_header: Optional[str] = Header(default=None, alias="session"),
     user: Optional[str] = Header(default=None),
 ):
+    if is_gemini_model(req.model):
+        return _gemini_chat_completion(req)
+
     if accounts.size() == 0:
         raise HTTPException(
             status_code=401,

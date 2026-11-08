@@ -1,8 +1,15 @@
 deepseek-pow>=0.0.1
-curl_cffi>=0.17.0
+
+# gemini-webapi 2.1.x pins curl-cffi to the 0.16.x series. DeepSeek also works
+# with it (chrome150 impersonation is available), so both providers share it.
+curl_cffi>=0.16.2,<0.17
+
 fastapi>=0.115.0
 uvicorn>=0.30.0
 pydantic>=2.0.0
 wasmtime>=20.0.0
 json-repair>=0.30
 json5>=0.9
+
+# Gemini web (gemini.google.com) support. Requires Python 3.11+.
+gemini-webapi>=2.1.1,<2.2
