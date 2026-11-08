@@ -62,7 +62,12 @@ STREAM_MAX_SECONDS = float(os.environ.get("GEMINI_STREAM_MAX_S", "600"))
 # Gemini's web model names are discovered per-account. These aliases are always
 # advertised and resolved by gemini_webapi's registry when the account supports
 # them.
-STATIC_MODEL_NAMES = ["gemini-flash", "gemini-pro", "gemini-flash-lite"]
+STATIC_MODEL_NAMES = [
+    "gemini-auto",
+    "gemini-flash",
+    "gemini-pro",
+    "gemini-flash-lite",
+]
 
 _COOKIE_PAIR_RE = re.compile(
     r"(__Secure-1PSIDTS|__Secure-1PSID)\s*=\s*([^;\s,\r\n\"'}]+)",
@@ -313,7 +318,7 @@ class GeminiProvider:
 
     def model_entries(self) -> List[Dict[str, Any]]:
         names: List[str] = []
-        for name in list(STATIC_MODEL_NAMES) + list(self._models):
+        for name in list(self._models) + list(STATIC_MODEL_NAMES):
             if name and name not in names:
                 names.append(name)
         return [
@@ -467,19 +472,54 @@ class GeminiProvider:
             return {"success": True, "message": "Gemini cookies removed."}
 
     # -- generation -----------------------------------------------------
-    def _resolve_model(self, client: GeminiClient, model: Optional[str]):
+    def _fallback_model(self, client: "GeminiClient"):
+        """Return the account's unified model when it only exposes one.
+
+        Google is rolling out a single ``gemini-auto`` entry to many accounts
+        instead of separate Flash/Pro entries. Friendly aliases then map onto
+        it, with ``gemini-pro`` enabling extended thinking.
+        """
+        for name in ("gemini-auto",) + tuple(self._models):
+            try:
+                return client.resolve_model(name)
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    def _resolve_model(
+        self, client: "GeminiClient", model: Optional[str]
+    ) -> Tuple[Any, bool]:
+        """Return ``(model_arg, extended_thinking)`` for a request."""
         name = (model or "").strip()
         if not name or name.lower() in ("gemini", "gemini-web", "gemini-default"):
-            return None
+            return None, False
+
         candidates = [name]
         if name.lower().startswith("gemini-"):
             candidates.append(name[7:])
         for candidate in candidates:
             try:
-                return client.resolve_model(candidate)
+                return client.resolve_model(candidate), False
             except Exception:  # noqa: BLE001
                 continue
-        available = ", ".join(list(STATIC_MODEL_NAMES) + list(self._models))
+
+        # The account may only expose "gemini-auto"; keep the friendly names
+        # working instead of failing every request.
+        lowered = name.lower()
+        if lowered in STATIC_MODEL_NAMES:
+            fallback = self._fallback_model(client)
+            if fallback is not None:
+                thinking = lowered.endswith("-pro")
+                print(
+                    f"[gemini] model alias {name} -> "
+                    f"{getattr(fallback, 'model_name', 'default')} "
+                    f"(extended_thinking={thinking})"
+                )
+                return fallback, thinking
+
+        available = ", ".join(
+            dict.fromkeys(list(self._models) + list(STATIC_MODEL_NAMES))
+        )
         raise GeminiModelError(
             f"Unknown Gemini model '{model}'. Available: {available}"
         )
@@ -502,12 +542,14 @@ class GeminiProvider:
     ) -> Tuple[str, str]:
         """Return ``(text, thoughts)`` for one stateless completion."""
         client = self._ensure_client()
+        model_arg, extended_thinking = self._resolve_model(client, model)
 
         async def _generate():
             return await client.generate_content(
                 prompt,
                 files=files or None,
-                model=self._resolve_model(client, model),
+                model=model_arg,
+                extended_thinking=extended_thinking,
             )
 
         with self._request_lock:
@@ -523,7 +565,7 @@ class GeminiProvider:
     ) -> Iterator[Tuple[str, str]]:
         """Yield ``("text"|"thinking", delta)`` tuples from Gemini's stream."""
         client = self._ensure_client()
-        model_arg = self._resolve_model(client, model)
+        model_arg, extended_thinking = self._resolve_model(client, model)
         # One Google account: serialize generation so cookie rotation and the
         # upstream session cannot race between concurrent requests.
         self._request_lock.acquire()
@@ -532,7 +574,10 @@ class GeminiProvider:
 
         async def _worker() -> None:
             generator = client.generate_content_stream(
-                prompt, files=files or None, model=model_arg
+                prompt,
+                files=files or None,
+                model=model_arg,
+                extended_thinking=extended_thinking,
             )
             try:
                 async for chunk in generator:
